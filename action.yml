@@ -1,0 +1,61 @@
+name: 'Logfire OIDC Auth'
+description: 'Authenticate GitHub Actions with Logfire via OIDC. No secrets needed — uses GitHub-issued JWTs to get short-lived Logfire tokens with configurable scopes. Tokens are automatically revoked when the job completes.'
+branding:
+  icon: 'lock'
+  color: 'orange'
+
+inputs:
+  organization:
+    description: 'Logfire organization slug'
+    required: true
+  project:
+    description: 'Logfire project slug (required for write token / SDK integration)'
+    required: false
+  scopes:
+    description: 'Comma-separated scopes to request (subset of trust policy). Example: "project:read,project:write"'
+    required: false
+  token-ttl-seconds:
+    description: 'Requested token TTL in seconds (60-86400, default: trust policy setting, max 1h unless explicitly extended to 24h)'
+    required: false
+  region:
+    description: 'Logfire region preset: us, eu, staging-eu. Determines the API URL automatically.'
+    required: false
+  url:
+    description: 'Custom Logfire API URL. Overrides the region preset. Use for self-hosted deployments.'
+    required: false
+  audience:
+    description: 'OIDC audience claim. Defaults to https://logfire.pydantic.dev. Override for self-hosted deployments.'
+    required: false
+  export-token:
+    description: 'Export LOGFIRE_TOKEN environment variable for logfire SDK/pytest integration (default: true)'
+    required: false
+    default: 'true'
+  export-traceparent:
+    description: 'Export TRACEPARENT environment variable for distributed tracing (default: true)'
+    required: false
+    default: 'true'
+  job-id:
+    description: 'Unique job identifier for traceparent. Set to "${{ github.job }}-${{ toJson(matrix) }}" in matrix workflows for unique span IDs per combination. Defaults to github.job.'
+    required: false
+
+outputs:
+  token:
+    description: 'Short-lived Logfire access token (JWT for API use)'
+  logfire-token:
+    description: 'Write token for SDK/intake (LOGFIRE_TOKEN). Only present when project is scoped.'
+  traceparent:
+    description: 'W3C traceparent header value linking to this workflow run'
+  trace-id:
+    description: 'Trace ID for this workflow run (deterministic from run context)'
+  expires-in:
+    description: 'Token TTL in seconds'
+  scopes:
+    description: 'Granted scopes (may differ from requested if narrowed by policy)'
+  logfire-url:
+    description: 'Resolved Logfire API URL'
+
+runs:
+  using: 'node24'
+  main: 'main.js'
+  post: 'cleanup.js'
+  post-if: 'always()'
