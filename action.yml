@@ -35,7 +35,7 @@ inputs:
     required: false
     default: 'true'
   job-id:
-    description: 'Unique job identifier for traceparent. Set to "${{ github.job }}-${{ toJson(matrix) }}" in matrix workflows for unique span IDs per combination. Defaults to github.job.'
+    description: 'Unique job identifier for traceparent. In matrix workflows, pass github.job + matrix context for unique span IDs per combination. Defaults to github.job.'
     required: false
 
 outputs:
