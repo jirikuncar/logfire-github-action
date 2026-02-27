@@ -9,7 +9,14 @@ inputs:
     description: 'Logfire organization slug'
     required: true
   project:
-    description: 'Logfire project slug (required for write token / SDK integration)'
+    description: 'Logfire project slug. Required when write-token is true.'
+    required: false
+  api-token:
+    description: 'Request a JWT access token for API use (default: true)'
+    required: false
+    default: 'true'
+  write-token:
+    description: 'Request a write token for SDK/intake. Defaults to true when project is provided, false otherwise. Requires project.'
     required: false
   scopes:
     description: 'Comma-separated scopes to request (subset of trust policy). Example: "project:read,project:write"'
@@ -35,7 +42,7 @@ inputs:
     required: false
     default: 'true'
   job-id:
-    description: 'Unique job identifier for traceparent. In matrix workflows, pass github.job + matrix context for unique span IDs per combination. Defaults to github.job.'
+    description: 'Unique job identifier for traceparent. Set to "${{ github.job }}-${{ toJson(matrix) }}" in matrix workflows for unique span IDs per combination. Defaults to github.job.'
     required: false
 
 outputs:

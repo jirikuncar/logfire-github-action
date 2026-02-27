@@ -6,7 +6,7 @@
  * 1. Resolves the Logfire API URL from region/url inputs
  * 2. Computes deterministic traceparent from run context
  * 3. Fetches a GitHub OIDC token
- * 4. Exchanges it for short-lived Logfire tokens
+ * 4. Exchanges it for short-lived Logfire tokens via RFC 8693
  * 5. Exports environment variables for SDK integration
  * 6. Saves state for post-action cleanup (token revocation)
  *
@@ -86,6 +86,48 @@ function httpRequest(url, options, body) {
     }
     req.end();
   });
+}
+
+// --- RFC 8693 token exchange helpers ---
+
+/**
+ * Build a form-encoded body for RFC 8693 token exchange.
+ */
+function buildTokenExchangeForm(idToken, audience, scope) {
+  const params = new URLSearchParams({
+    grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+    subject_token: idToken,
+    subject_token_type: 'urn:ietf:params:oauth:token-type:jwt',
+    audience: audience,
+  });
+  if (scope) {
+    params.set('scope', scope);
+  }
+  return params.toString();
+}
+
+/**
+ * Perform an RFC 8693 token exchange request.
+ */
+async function tokenExchange(url, formBody) {
+  const response = await httpRequest(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Content-Length': Buffer.byteLength(formBody),
+    },
+  }, formBody);
+
+  if (response.statusCode !== 200) {
+    let detail = response.body;
+    try {
+      const parsed = JSON.parse(response.body);
+      detail = parsed.error_description || parsed.error || detail;
+    } catch (_) { /* use raw body */ }
+    throw new Error(`Token exchange failed (HTTP ${response.statusCode}): ${detail}`);
+  }
+
+  return JSON.parse(response.body);
 }
 
 // --- OIDC token fetching ---
@@ -191,50 +233,68 @@ async function main() {
     const idToken = await getIDToken(audience);
     setSecret(idToken);
 
-    // 4. Build exchange request body
+    // 4. Build audience URL for RFC 8693 token exchange
     const organization = getInput('organization');
     if (!organization) {
       throw new Error('Input "organization" is required');
     }
 
-    const body = { token: idToken, organization };
-
     const project = getInput('project');
-    if (project) body.project = project;
+
+    // Resolve token flags
+    const wantApiToken = getInput('api-token') !== 'false';
+    const writeTokenInput = getInput('write-token');
+    const wantWriteToken = writeTokenInput
+      ? writeTokenInput !== 'false'
+      : !!project; // default: true when project is provided
+
+    if (wantWriteToken && !project) {
+      throw new Error('Input "project" is required when write-token is true');
+    }
+
+    if (!wantApiToken && !wantWriteToken) {
+      throw new Error('At least one of api-token or write-token must be true');
+    }
+
+    const audienceUrl = project
+      ? `${audience}/${organization}/${project}`
+      : `${audience}/${organization}`;
 
     const scopes = getInput('scopes');
-    if (scopes) {
-      body.scopes = scopes.split(',').map((s) => s.trim()).filter(Boolean);
+    // Convert comma-separated scopes to space-separated per RFC 8693
+    const scopeParam = scopes
+      ? scopes.split(',').map((s) => s.trim()).filter(Boolean).join(' ')
+      : '';
+
+    // 5. Exchange OIDC token for Logfire tokens via RFC 8693
+    let accessToken = '';
+    let logfireToken = '';
+    let expiresIn = 0;
+    let grantedScopes = '';
+
+    // Get write token for SDK/intake (requires project)
+    if (wantWriteToken) {
+      const writeTokenForm = buildTokenExchangeForm(idToken, audienceUrl, scopeParam);
+      const writeResult = await tokenExchange(
+        `${resolvedUrl}/api/oidc/write-token`,
+        writeTokenForm,
+      );
+      logfireToken = writeResult.access_token;
+      expiresIn = writeResult.expires_in;
+      debug('Obtained write token via /api/oidc/write-token');
     }
 
-    const ttl = getInput('token-ttl-seconds');
-    if (ttl) body.token_ttl_seconds = parseInt(ttl, 10);
-
-    // 5. Exchange OIDC token for Logfire tokens
-    const exchangeUrl = `${resolvedUrl}/api/github/oidc/exchange`;
-    const bodyStr = JSON.stringify(body);
-
-    const response = await httpRequest(exchangeUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(bodyStr),
-      },
-    }, bodyStr);
-
-    if (response.statusCode !== 200) {
-      let detail = response.body;
-      try {
-        detail = JSON.parse(response.body).detail || detail;
-      } catch (_) { /* use raw body */ }
-      throw new Error(`Logfire OIDC exchange failed (HTTP ${response.statusCode}): ${detail}`);
+    // Get JWT access token for API access
+    if (wantApiToken) {
+      const jwtForm = buildTokenExchangeForm(idToken, audienceUrl, scopeParam);
+      const jwtResult = await tokenExchange(
+        `${resolvedUrl}/api/oidc/token`,
+        jwtForm,
+      );
+      accessToken = jwtResult.access_token;
+      if (!expiresIn) expiresIn = jwtResult.expires_in;
+      grantedScopes = jwtResult.scope || '';
     }
-
-    const result = JSON.parse(response.body);
-    const accessToken = result.access_token;
-    const logfireToken = result.logfire_token || '';
-    const expiresIn = result.expires_in;
-    const grantedScopes = (result.scopes || []).join(',');
 
     // Mask tokens
     setSecret(accessToken);
@@ -255,10 +315,8 @@ async function main() {
     const exportToken = getInput('export-token') !== 'false';
     const exportTraceparent = getInput('export-traceparent') !== 'false';
 
-    if (exportToken) {
-      // Prefer write token (works with ingest), fall back to access token (API only)
-      const tokenForSdk = logfireToken || accessToken;
-      exportVariable('LOGFIRE_TOKEN', tokenForSdk);
+    if (exportToken && logfireToken) {
+      exportVariable('LOGFIRE_TOKEN', logfireToken);
       exportVariable('LOGFIRE_BASE_URL', resolvedUrl);
       exportVariable('LOGFIRE_SEND_TO_LOGFIRE', 'true');
     }
@@ -267,7 +325,11 @@ async function main() {
       exportVariable('TRACEPARENT', traceparent);
     }
 
-    console.log(`Logfire OIDC authentication successful (expires in ${expiresIn}s, scopes: ${grantedScopes})`);
+    const tokenSummary = [
+      wantApiToken && 'api-token',
+      wantWriteToken && 'write-token',
+    ].filter(Boolean).join(', ');
+    console.log(`Logfire OIDC authentication successful (${tokenSummary}, expires in ${expiresIn}s, scopes: ${grantedScopes})`);
   } catch (error) {
     setFailed(error.message);
   }
