@@ -34,10 +34,10 @@ Pass the action's outputs into the steps that need them — the action itself do
 ## How it works
 
 1. The action calls GitHub's OIDC provider to mint a JWT bound to this workflow run. The JWT's `aud` claim is the resolved Logfire URL (or your explicit `audience`).
-2. It exchanges that JWT against Logfire's RFC 8693 token endpoint at `POST /api/oidc/token`. The exchange audience is `{resolvedUrl}/{organization}[/{project}]` so the backend can route to the right org / project — or, if you set `audience` explicitly, that value verbatim.
+2. It exchanges that JWT against Logfire's RFC 8693 token endpoint at `POST /api/oauth/token`. The exchange audience is `{resolvedUrl}/{organization}[/{project}]` so the backend can route to the right org / project — or, if you set `audience` explicitly, that value verbatim.
 3. The backend matches the JWT claims against an active trust policy in the org, mints a workload JWT (`subject_type=workload`) carrying the policy's scopes, and returns it on `outputs.token`.
 4. The trust policy decides which Logfire surfaces the issued token can reach. Whatever the resource server (API, OTLP intake, gateway proxy, …) requires — scope, project binding, audience — is enforced when the token is actually used, not preemptively by the action.
-5. On job completion the post step calls `POST /api/oidc/revoke` (RFC 7009) so the token is invalidated immediately rather than waiting for `exp`.
+5. On job completion the post step calls `POST /api/oauth/revoke` (RFC 7009) so the token is invalidated immediately rather than waiting for `exp`.
 
 ## Inputs
 

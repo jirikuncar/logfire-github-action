@@ -7,7 +7,7 @@
  * 2. Computes a deterministic traceparent from the run context
  * 3. Fetches a GitHub OIDC JWT
  * 4. Exchanges it for a short-lived Logfire workload token
- *    (`POST /api/oidc/token`). The trust policy decides which scopes the
+ *    (`POST /api/oauth/token`). The trust policy decides which scopes the
  *    issued token carries and therefore which Logfire surfaces it can
  *    reach.
  * 5. Saves state for the post-action revocation step
@@ -250,7 +250,7 @@ async function main() {
     //    policy rejects the request (claims don't match, requested scope
     //    outside the policy, etc.) the exchange returns an RFC 6749 §5.2
     //    error envelope and the action fails the step.
-    const result = await exchangeToken(`${resolvedUrl}/api/oidc/token`, {
+    const result = await exchangeToken(`${resolvedUrl}/api/oauth/token`, {
       subjectToken,
       audience: exchangeAudience,
       scope,

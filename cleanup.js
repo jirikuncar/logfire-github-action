@@ -3,7 +3,7 @@
  * Logfire OIDC Auth — post-action cleanup.
  *
  * Revokes the workload token issued during the main step via the RFC 7009
- * revocation endpoint (`POST /api/oidc/revoke`). Runs as the `post` entry
+ * revocation endpoint (`POST /api/oauth/revoke`). Runs as the `post` entry
  * point, so it executes even when the job fails.
  *
  * Uses only built-in Node.js modules — no npm dependencies required.
@@ -63,7 +63,7 @@ async function cleanup() {
   }
 
   try {
-    const ok = await revokeToken(`${logfireUrl}/api/oidc/revoke`, accessToken);
+    const ok = await revokeToken(`${logfireUrl}/api/oauth/revoke`, accessToken);
     if (ok) {
       debug('Revoked workload token');
     } else {
