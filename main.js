@@ -2,22 +2,22 @@
 /**
  * Logfire OIDC Auth — main action entry point.
  *
- * Authenticates GitHub Actions with Logfire via OIDC:
+ * Authenticates GitHub Actions with Logfire via RFC 8693 token exchange:
  * 1. Resolves the Logfire API URL from region/url inputs
- * 2. Computes deterministic traceparent from run context
- * 3. Fetches a GitHub OIDC token
- * 4. Exchanges it for short-lived Logfire tokens via RFC 8693
- * 5. Exports environment variables for SDK integration
- * 6. Saves state for post-action cleanup (token revocation)
+ * 2. Computes a deterministic traceparent from the run context
+ * 3. Fetches a GitHub OIDC JWT
+ * 4. Exchanges it for a short-lived Logfire workload token
+ *    (`POST /api/oidc/token`). The trust policy decides which scopes the
+ *    issued token carries and therefore which Logfire surfaces it can
+ *    reach.
+ * 5. Saves state for the post-action revocation step
  *
  * Uses only built-in Node.js modules — no npm dependencies required.
  */
 
-const https = require('https');
-const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
-const path = require('path');
+const { requestWithRetry } = require('./http-client');
 
 // --- GitHub Actions helpers (no @actions/core dependency) ---
 
@@ -28,13 +28,6 @@ function getInput(name) {
 
 function setOutput(name, value) {
   const filePath = process.env.GITHUB_OUTPUT;
-  if (filePath) {
-    fs.appendFileSync(filePath, `${name}=${value}\n`);
-  }
-}
-
-function exportVariable(name, value) {
-  const filePath = process.env.GITHUB_ENV;
   if (filePath) {
     fs.appendFileSync(filePath, `${name}=${value}\n`);
   }
@@ -58,65 +51,34 @@ function setFailed(message) {
   process.exitCode = 1;
 }
 
-function warning(message) {
-  console.log(`::warning::${message}`);
-}
-
 function debug(message) {
   console.log(`::debug::${message}`);
 }
 
-// --- HTTP helpers ---
+// --- RFC 8693 token exchange ---
 
-function httpRequest(url, options, body) {
-  return new Promise((resolve, reject) => {
-    const parsedUrl = new URL(url);
-    const transport = parsedUrl.protocol === 'https:' ? https : http;
+const TOKEN_EXCHANGE_GRANT = 'urn:ietf:params:oauth:grant-type:token-exchange';
+const JWT_TOKEN_TYPE = 'urn:ietf:params:oauth:token-type:jwt';
 
-    const req = transport.request(url, options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        resolve({ statusCode: res.statusCode, body: data, headers: res.headers });
-      });
-    });
-    req.on('error', reject);
-    if (body) {
-      req.write(body);
-    }
-    req.end();
-  });
-}
-
-// --- RFC 8693 token exchange helpers ---
-
-/**
- * Build a form-encoded body for RFC 8693 token exchange.
- */
-function buildTokenExchangeForm(idToken, audience, scope) {
+async function exchangeToken(tokenUrl, { subjectToken, audience, scope }, httpOpts) {
   const params = new URLSearchParams({
-    grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
-    subject_token: idToken,
-    subject_token_type: 'urn:ietf:params:oauth:token-type:jwt',
-    audience: audience,
+    grant_type: TOKEN_EXCHANGE_GRANT,
+    subject_token: subjectToken,
+    subject_token_type: JWT_TOKEN_TYPE,
+    audience,
   });
   if (scope) {
     params.set('scope', scope);
   }
-  return params.toString();
-}
+  const formBody = params.toString();
 
-/**
- * Perform an RFC 8693 token exchange request.
- */
-async function tokenExchange(url, formBody) {
-  const response = await httpRequest(url, {
+  const response = await requestWithRetry(tokenUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
       'Content-Length': Buffer.byteLength(formBody),
     },
-  }, formBody);
+  }, formBody, httpOpts);
 
   if (response.statusCode !== 200) {
     let detail = response.body;
@@ -130,9 +92,9 @@ async function tokenExchange(url, formBody) {
   return JSON.parse(response.body);
 }
 
-// --- OIDC token fetching ---
+// --- GitHub OIDC token fetching ---
 
-async function getIDToken(audience) {
+async function getIDToken(audience, httpOpts) {
   const requestUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
   const requestToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
 
@@ -144,20 +106,19 @@ async function getIDToken(audience) {
   }
 
   const url = `${requestUrl}&audience=${encodeURIComponent(audience)}`;
-  const response = await httpRequest(url, {
+  const response = await requestWithRetry(url, {
     method: 'GET',
     headers: {
       Authorization: `bearer ${requestToken}`,
       Accept: 'application/json',
     },
-  });
+  }, undefined, httpOpts);
 
   if (response.statusCode !== 200) {
-    throw new Error(`Failed to get OIDC token (HTTP ${response.statusCode}): ${response.body}`);
+    throw new Error(`Failed to get GitHub OIDC token (HTTP ${response.statusCode}): ${response.body}`);
   }
 
-  const json = JSON.parse(response.body);
-  return json.value;
+  return JSON.parse(response.body).value;
 }
 
 // --- Traceparent computation ---
@@ -170,20 +131,17 @@ function computeTraceId(runId, runAttempt) {
   return sha256hex(`logfire:github:trace:${runId}:${runAttempt}`).substring(0, 32);
 }
 
-function computeRunSpanId(runId, runAttempt) {
-  return sha256hex(`logfire:github:run:${runId}:${runAttempt}`).substring(0, 16);
-}
-
 function computeJobSpanId(runId, runAttempt, jobName) {
   return sha256hex(`logfire:github:job:${runId}:${runAttempt}:${jobName}`).substring(0, 16);
 }
 
 // --- URL resolution ---
 
+/** @type {Record<string, string>} */
 const REGION_URLS = {
-  us: 'https://logfire-api.pydantic.dev',
-  eu: 'https://logfire-api-eu.pydantic.dev',
-  'staging-eu': 'https://logfire-api-staging-eu.pydantic.dev',
+  us: 'https://logfire-us.pydantic.dev',
+  eu: 'https://logfire-eu.pydantic.dev',
+  'staging-eu': 'https://logfire-eu.pydantic.info',
 };
 
 function resolveUrl(region, url) {
@@ -202,26 +160,37 @@ function resolveUrl(region, url) {
 
 async function main() {
   try {
-    // 1. Resolve URL and audience
+    // 1. Resolve URL
     const region = getInput('region');
     const url = getInput('url');
     const resolvedUrl = resolveUrl(region, url);
-    const audience = getInput('audience') || 'https://logfire.pydantic.dev';
 
     setOutput('logfire-url', resolvedUrl);
     debug(`Resolved Logfire URL: ${resolvedUrl}`);
 
-    // 2. Compute traceparent
-    // For matrix jobs, GITHUB_JOB is the same across all matrix entries.
-    // We incorporate the matrix context (passed via job-id input) to produce
-    // unique span IDs per matrix combination. Without it, all matrix entries
-    // would share the same job span ID.
+    // HTTP behavior: retries, per-request timeout, and proxy. The proxy
+    // override falls back to the HTTPS_PROXY/HTTP_PROXY/NO_PROXY env vars when
+    // empty. Retries cover transient network errors, timeouts, 429, and 5xx —
+    // a 4xx policy rejection (invalid_scope, invalid_target) is not retried.
+    const maxRetriesInput = parseInt(getInput('max-retries'), 10);
+    const timeoutInput = parseInt(getInput('request-timeout'), 10);
+    const httpOpts = {
+      maxRetries: Number.isNaN(maxRetriesInput) ? undefined : Math.max(0, maxRetriesInput),
+      timeoutMs: Number.isNaN(timeoutInput) ? undefined : Math.max(1, timeoutInput) * 1000,
+      proxy: getInput('proxy') || undefined,
+      /** @param {{attempt: number, maxRetries: number, reason: string, delayMs: number}} info */
+      onRetry: (info) =>
+        debug(`Retry ${info.attempt}/${info.maxRetries} in ${info.delayMs}ms (${info.reason})`),
+    };
+
+    // 2. Compute traceparent. For matrix jobs, GITHUB_JOB collapses across
+    //    matrix entries — incorporate `job-id` so each combination gets a
+    //    unique span id.
     const runId = process.env.GITHUB_RUN_ID || '';
     const runAttempt = process.env.GITHUB_RUN_ATTEMPT || '1';
     const jobId = getInput('job-id') || process.env.GITHUB_JOB || '';
 
     const traceId = computeTraceId(runId, runAttempt);
-    const runSpanId = computeRunSpanId(runId, runAttempt);
     const jobSpanId = computeJobSpanId(runId, runAttempt, jobId);
     const traceparent = `00-${traceId}-${jobSpanId}-01`;
 
@@ -229,107 +198,83 @@ async function main() {
     setOutput('trace-id', traceId);
     debug(`Traceparent: ${traceparent}`);
 
-    // 3. Get GitHub OIDC token
-    const idToken = await getIDToken(audience);
-    setSecret(idToken);
-
-    // 4. Build audience URL for RFC 8693 token exchange
+    // 3. Resolve the audience. Two mutually-exclusive modes:
+    //    - Explicit `audience`: used verbatim for both the OIDC JWT `aud`
+    //      claim and the RFC 8693 exchange. It must already encode whatever
+    //      org/project path the backend expects, so `organization`/`project`
+    //      are rejected here to avoid an ambiguous double-encoding.
+    //    - Otherwise: the OIDC `aud` claim is the resolved Logfire URL and the
+    //      exchange audience encodes the org (+ optional project) as a path,
+    //      which the backend parses to route to the right org/project.
+    const audienceInput = getInput('audience');
     const organization = getInput('organization');
-    if (!organization) {
-      throw new Error('Input "organization" is required');
-    }
-
     const project = getInput('project');
 
-    // Resolve token flags
-    const wantApiToken = getInput('api-token') !== 'false';
-    const writeTokenInput = getInput('write-token');
-    const wantWriteToken = writeTokenInput
-      ? writeTokenInput !== 'false'
-      : !!project; // default: true when project is provided
-
-    if (wantWriteToken && !project) {
-      throw new Error('Input "project" is required when write-token is true');
+    if (audienceInput && (organization || project)) {
+      throw new Error(
+        'Input "audience" cannot be combined with "organization" or "project". ' +
+        'Provide a full audience that already encodes the org/project path, or ' +
+        'omit "audience" and pass "organization" (+ optional "project") instead.'
+      );
     }
 
-    if (!wantApiToken && !wantWriteToken) {
-      throw new Error('At least one of api-token or write-token must be true');
+    let oidcAudience;
+    let exchangeAudience;
+    if (audienceInput) {
+      oidcAudience = audienceInput;
+      exchangeAudience = audienceInput;
+    } else {
+      if (!organization) {
+        throw new Error('Input "organization" is required (unless a full "audience" is provided)');
+      }
+      oidcAudience = resolvedUrl;
+      exchangeAudience = project
+        ? `${resolvedUrl}/${organization}/${project}`
+        : `${resolvedUrl}/${organization}`;
     }
 
-    const audienceUrl = project
-      ? `${audience}/${organization}/${project}`
-      : `${audience}/${organization}`;
+    // 4. Fetch the GitHub OIDC JWT
+    const subjectToken = await getIDToken(oidcAudience, httpOpts);
+    setSecret(subjectToken);
 
-    const scopes = getInput('scopes');
-    // Convert comma-separated scopes to space-separated per RFC 8693
-    const scopeParam = scopes
-      ? scopes.split(',').map((s) => s.trim()).filter(Boolean).join(' ')
+    // Scopes are space-separated, per the OAuth / RFC 8693 convention. Collapse
+    // any whitespace (newlines, double spaces) the input may carry into single
+    // separators. Validity of the requested scopes is enforced by the exchange
+    // endpoint against the trust policy.
+    const scopesInput = getInput('scopes');
+    const scope = scopesInput
+      ? scopesInput.split(/\s+/).filter(Boolean).join(' ')
       : '';
 
-    // 5. Exchange OIDC token for Logfire tokens via RFC 8693
-    let accessToken = '';
-    let logfireToken = '';
-    let expiresIn = 0;
-    let grantedScopes = '';
+    // 5. Exchange the OIDC JWT for a Logfire workload token. If the trust
+    //    policy rejects the request (claims don't match, requested scope
+    //    outside the policy, etc.) the exchange returns an RFC 6749 §5.2
+    //    error envelope and the action fails the step.
+    const result = await exchangeToken(`${resolvedUrl}/api/oidc/token`, {
+      subjectToken,
+      audience: exchangeAudience,
+      scope,
+    }, httpOpts);
 
-    // Get write token for SDK/intake (requires project)
-    if (wantWriteToken) {
-      const writeTokenForm = buildTokenExchangeForm(idToken, audienceUrl, scopeParam);
-      const writeResult = await tokenExchange(
-        `${resolvedUrl}/api/oidc/write-token`,
-        writeTokenForm,
-      );
-      logfireToken = writeResult.access_token;
-      expiresIn = writeResult.expires_in;
-      debug('Obtained write token via /api/oidc/write-token');
-    }
+    const accessToken = result.access_token;
+    const expiresIn = result.expires_in;
+    const grantedScopes = result.scope || '';
 
-    // Get JWT access token for API access
-    if (wantApiToken) {
-      const jwtForm = buildTokenExchangeForm(idToken, audienceUrl, scopeParam);
-      const jwtResult = await tokenExchange(
-        `${resolvedUrl}/api/oidc/token`,
-        jwtForm,
-      );
-      accessToken = jwtResult.access_token;
-      if (!expiresIn) expiresIn = jwtResult.expires_in;
-      grantedScopes = jwtResult.scope || '';
-    }
-
-    // Mask tokens
     setSecret(accessToken);
-    if (logfireToken) setSecret(logfireToken);
 
-    // Set outputs
     setOutput('token', accessToken);
-    setOutput('logfire-token', logfireToken);
     setOutput('expires-in', String(expiresIn));
     setOutput('scopes', grantedScopes);
 
-    // 6. Save state for post-action cleanup
+    // 6. Save state for the post-action revocation step. `skip-cleanup` is
+    //    persisted here (rather than read in the post step) because input env
+    //    vars aren't guaranteed in the post context.
+    const skipCleanup = getInput('skip-cleanup').toLowerCase() === 'true';
     saveState('access_token', accessToken);
-    saveState('logfire_token', logfireToken);
     saveState('logfire_url', resolvedUrl);
+    saveState('skip_cleanup', skipCleanup ? 'true' : '');
 
-    // 7. Export environment variables
-    const exportToken = getInput('export-token') !== 'false';
-    const exportTraceparent = getInput('export-traceparent') !== 'false';
-
-    if (exportToken && logfireToken) {
-      exportVariable('LOGFIRE_TOKEN', logfireToken);
-      exportVariable('LOGFIRE_BASE_URL', resolvedUrl);
-      exportVariable('LOGFIRE_SEND_TO_LOGFIRE', 'true');
-    }
-
-    if (exportTraceparent) {
-      exportVariable('TRACEPARENT', traceparent);
-    }
-
-    const tokenSummary = [
-      wantApiToken && 'api-token',
-      wantWriteToken && 'write-token',
-    ].filter(Boolean).join(', ');
-    console.log(`Logfire OIDC authentication successful (${tokenSummary}, expires in ${expiresIn}s, scopes: ${grantedScopes})`);
+    console.log(`Logfire OIDC authentication successful (expires in ${expiresIn}s, scopes: ${grantedScopes})`);
   } catch (error) {
     setFailed(error.message);
   }

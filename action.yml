@@ -1,28 +1,18 @@
 name: 'Logfire OIDC Auth'
-description: 'Authenticate GitHub Actions with Logfire via OIDC. No secrets needed — uses GitHub-issued JWTs to get short-lived Logfire tokens with configurable scopes. Tokens are automatically revoked when the job completes.'
+description: 'Authenticate GitHub Actions with Logfire via OIDC token exchange (RFC 8693). No secrets needed — GitHub-issued JWTs are exchanged for a short-lived Logfire workload token whose scopes are pinned by your trust policy. The token is automatically revoked when the job completes.'
 branding:
   icon: 'lock'
-  color: 'orange'
+  color: 'purple'
 
 inputs:
   organization:
-    description: 'Logfire organization slug'
-    required: true
+    description: 'Logfire organization slug. Required unless a full "audience" is provided. Mutually exclusive with "audience".'
+    required: false
   project:
-    description: 'Logfire project slug. Required when write-token is true.'
-    required: false
-  api-token:
-    description: 'Request a JWT access token for API use (default: true)'
-    required: false
-    default: 'true'
-  write-token:
-    description: 'Request a write token for SDK/intake. Defaults to true when project is provided, false otherwise. Requires project.'
+    description: 'Logfire project slug. Narrows the workload token to a single project when the trust policy is org-wide; must equal the policy''s project when it is already project-bound. Mutually exclusive with "audience".'
     required: false
   scopes:
-    description: 'Comma-separated scopes to request (subset of trust policy). Example: "project:read,project:write"'
-    required: false
-  token-ttl-seconds:
-    description: 'Requested token TTL in seconds (60-86400, default: trust policy setting, max 1h unless explicitly extended to 24h)'
+    description: 'Space-separated scopes to request (must be a subset of the trust policy). When omitted, the policy''s full scope set is granted. Example: "project:write_otlp project:read_otlp"'
     required: false
   region:
     description: 'Logfire region preset: us, eu, staging-eu. Determines the API URL automatically.'
@@ -31,33 +21,38 @@ inputs:
     description: 'Custom Logfire API URL. Overrides the region preset. Use for self-hosted deployments.'
     required: false
   audience:
-    description: 'OIDC audience claim. Defaults to https://logfire.pydantic.dev. Override for self-hosted deployments.'
+    description: 'Full OIDC/exchange audience, used verbatim for both the GitHub OIDC JWT aud claim and the RFC 8693 exchange. Must already encode the org/project path the backend expects. When omitted, the OIDC aud claim defaults to the resolved Logfire URL and the exchange audience is built from "organization"/"project". Mutually exclusive with "organization" and "project".'
     required: false
-  export-token:
-    description: 'Export LOGFIRE_TOKEN environment variable for logfire SDK/pytest integration (default: true)'
-    required: false
-    default: 'true'
-  export-traceparent:
-    description: 'Export TRACEPARENT environment variable for distributed tracing (default: true)'
-    required: false
-    default: 'true'
   job-id:
     description: 'Unique job identifier for traceparent. Use github.job + matrix context in matrix workflows for unique span IDs per combination. Defaults to github.job.'
+    required: false
+  skip-cleanup:
+    description: 'When "true", skip the post-job token revocation and let the token expire naturally. Useful for self-hosted runners that reuse the token across steps after the action completes.'
+    required: false
+    default: 'false'
+  max-retries:
+    description: 'Number of retry attempts for transient HTTP failures (network errors, request timeouts, HTTP 408/429, and 5xx), using jittered exponential backoff. A 4xx policy rejection is never retried. Set to 0 to disable retries.'
+    required: false
+    default: '3'
+  request-timeout:
+    description: 'Per-request socket timeout in seconds. A request that stalls longer is aborted (and retried, if attempts remain).'
+    required: false
+    default: '10'
+  proxy:
+    description: 'Proxy URL (e.g. http://proxy.internal:8080) for reaching Logfire and GitHub OIDC. When omitted, the standard HTTPS_PROXY / HTTP_PROXY / NO_PROXY environment variables are honored.'
     required: false
 
 outputs:
   token:
-    description: 'Short-lived Logfire access token (JWT for API use)'
-  logfire-token:
-    description: 'Write token for SDK/intake (LOGFIRE_TOKEN). Only present when project is scoped.'
+    description: 'Short-lived Logfire workload access token (JWT). Use it as a bearer token for the API, OTLP intake, gateway proxy, etc. — scopes are determined by the trust policy.'
   traceparent:
     description: 'W3C traceparent header value linking to this workflow run'
   trace-id:
     description: 'Trace ID for this workflow run (deterministic from run context)'
   expires-in:
-    description: 'Token TTL in seconds'
+    description: 'Token TTL in seconds (set by the trust policy)'
   scopes:
-    description: 'Granted scopes (may differ from requested if narrowed by policy)'
+    description: 'Granted scopes (may be narrower than requested if the policy narrows them)'
   logfire-url:
     description: 'Resolved Logfire API URL'
 

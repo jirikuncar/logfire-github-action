@@ -1,8 +1,8 @@
 # Logfire OIDC Auth GitHub Action
 
-Authenticate GitHub Actions with [Logfire](https://logfire.pydantic.dev) via OpenID Connect (OIDC). No stored secrets needed — GitHub provides short-lived JWTs that Logfire validates directly.
+Authenticate GitHub Actions with [Logfire](https://logfire.pydantic.dev) via OpenID Connect (OIDC). No stored secrets needed — GitHub's short-lived JWT is exchanged for a single short-lived Logfire workload token (RFC 8693). The token's scopes are pinned by the trust policy you configure once in Logfire, so what CI can do is auditable from the Logfire UI rather than from what was passed to `with:`.
 
-Tokens are automatically revoked when the job completes via a built-in post step.
+The workload token is automatically revoked when the job completes via a built-in post step.
 
 ## Quick Start
 
@@ -14,44 +14,61 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: jirikuncar/logfire-github-action@main
+      - id: logfire
+        uses: jirikuncar/logfire-github-action@main
         with:
           organization: myorg
           project: myapp
-          region: us
 
       - uses: actions/checkout@v4
       - run: pip install -e ".[test]"
       - run: pytest --logfire
+        env:
+          LOGFIRE_TOKEN: ${{ steps.logfire.outputs.token }}
+          LOGFIRE_BASE_URL: ${{ steps.logfire.outputs.logfire-url }}
+          TRACEPARENT: ${{ steps.logfire.outputs.traceparent }}
 ```
 
-After this step, `LOGFIRE_TOKEN`, `LOGFIRE_BASE_URL`, and `TRACEPARENT` are automatically set as environment variables. The logfire SDK and pytest plugin pick them up with zero configuration.
+Pass the action's outputs into the steps that need them — the action itself doesn't mutate the job environment, so the same token can be wired to the SDK, the Logfire API, or the gateway proxy as needed.
+
+## How it works
+
+1. The action calls GitHub's OIDC provider to mint a JWT bound to this workflow run. The JWT's `aud` claim is the resolved Logfire URL (or your explicit `audience`).
+2. It exchanges that JWT against Logfire's RFC 8693 token endpoint at `POST /api/oidc/token`. The exchange audience is `{resolvedUrl}/{organization}[/{project}]` so the backend can route to the right org / project — or, if you set `audience` explicitly, that value verbatim.
+3. The backend matches the JWT claims against an active trust policy in the org, mints a workload JWT (`subject_type=workload`) carrying the policy's scopes, and returns it on `outputs.token`.
+4. The trust policy decides which Logfire surfaces the issued token can reach. Whatever the resource server (API, OTLP intake, gateway proxy, …) requires — scope, project binding, audience — is enforced when the token is actually used, not preemptively by the action.
+5. On job completion the post step calls `POST /api/oidc/revoke` (RFC 7009) so the token is invalidated immediately rather than waiting for `exp`.
 
 ## Inputs
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `organization` | Yes | — | Logfire organization slug |
-| `project` | No | — | Logfire project slug. Required for write token / SDK integration |
-| `scopes` | No | — | Comma-separated scopes (e.g. `project:read,project:write`) |
-| `token-ttl-seconds` | No | Trust policy setting | Token TTL in seconds (60–86400) |
+| `organization` | Yes¹ | — | Logfire organization slug. Mutually exclusive with `audience` |
+| `project` | No | — | Logfire project slug. Narrows the issued token to a single project (when the policy is org-wide), or pins to the policy's project (when bound). Mutually exclusive with `audience` |
+| `scopes` | No | Trust policy default | Space-separated subset of the trust policy's scopes (e.g. `project:write_otlp project:read_otlp`) |
 | `region` | No | `us` | Region preset: `us`, `eu`, `staging-eu` |
 | `url` | No | — | Custom Logfire API URL (overrides `region`) |
-| `audience` | No | Derived from URL | OIDC audience claim |
-| `export-token` | No | `true` | Export `LOGFIRE_TOKEN` env var |
-| `export-traceparent` | No | `true` | Export `TRACEPARENT` env var |
+| `audience` | No | resolved Logfire URL² | Full audience, used verbatim. Mutually exclusive with `organization`/`project` |
 | `job-id` | No | `github.job` | Unique job ID for traceparent (use with matrix) |
+| `skip-cleanup` | No | `false` | When `true`, skip post-job token revocation and let the token expire naturally |
+| `max-retries` | No | `3` | Retry attempts for transient HTTP failures (network/timeout/408/429/5xx). `0` disables |
+| `request-timeout` | No | `10` | Per-request socket timeout, in seconds |
+| `proxy` | No | env | Proxy URL; falls back to `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` env vars |
+
+¹ Required unless you provide a full `audience` that already encodes the org/project path.
+² When `audience` is omitted, the GitHub OIDC JWT `aud` claim defaults to the resolved Logfire URL and the exchange audience is built as `{resolvedUrl}/{organization}[/{project}]`. When `audience` is provided it is used verbatim for both — `organization`/`project` must then be omitted.
+
+Token TTL is fixed by the trust policy (`token_ttl_seconds`). The action cannot extend it.
 
 ## Outputs
 
 | Output | Description |
 |--------|-------------|
-| `token` | Short-lived JWT access token for API use |
-| `logfire-token` | Write token for SDK/intake (`LOGFIRE_TOKEN`) |
+| `token` | Short-lived Logfire workload JWT |
 | `traceparent` | W3C traceparent header value |
 | `trace-id` | Deterministic trace ID for this workflow run |
-| `expires-in` | Token TTL in seconds |
-| `scopes` | Granted scopes (comma-separated) |
+| `expires-in` | Token TTL in seconds (set by the trust policy) |
+| `scopes` | Granted scopes (may be narrower than requested) |
 | `logfire-url` | Resolved Logfire API URL |
 
 ## Configuration Examples
@@ -77,8 +94,6 @@ After this step, `LOGFIRE_TOKEN`, `LOGFIRE_BASE_URL`, and `TRACEPARENT` are auto
 
 ### Self-Hosted Logfire
 
-For self-hosted Logfire deployments, use the `url` input to point at your instance. The audience defaults to `https://logfire.pydantic.dev` for all deployments:
-
 ```yaml
 - uses: jirikuncar/logfire-github-action@main
   with:
@@ -87,28 +102,88 @@ For self-hosted Logfire deployments, use the `url` input to point at your instan
     url: https://logfire.internal.company.com
 ```
 
-### Self-Hosted with GitHub Enterprise
+When `audience` is omitted, the GitHub OIDC JWT's `aud` claim defaults to `url` (the resolved Logfire URL), which is what your self-hosted backend validates against (`GITHUB_OIDC_AUDIENCE`). Set those equal and you don't need `audience` at all.
 
-If you're using GitHub Enterprise Server with a custom OIDC issuer, ensure your self-hosted Logfire backend is configured with:
+If your backend expects a different `aud` value (or a fully custom exchange audience), provide `audience` explicitly — but then it is used **verbatim** and must already encode the org/project path, so `organization`/`project` must be omitted:
 
-```env
-GITHUB_OIDC_ISSUER=https://github.yourcompany.com/_services/token
-GITHUB_OIDC_JWKS_URL=https://github.yourcompany.com/_services/token/.well-known/jwks
+```yaml
+- uses: jirikuncar/logfire-github-action@main
+  with:
+    url: https://logfire.internal.company.com
+    audience: https://logfire.internal.company.com/myorg/myapp
 ```
 
-Then in your workflow:
+### Narrowing scopes per workflow
+
+The trust policy defines the upper bound. A workflow that only needs a subset can request just that:
 
 ```yaml
 - uses: jirikuncar/logfire-github-action@main
   with:
     organization: myorg
     project: myapp
-    url: https://logfire.internal.company.com
+    scopes: project:write_otlp
 ```
+
+If the policy doesn't grant the requested scope, the exchange returns `invalid_scope` and the step fails.
+
+### Downscoping an org-wide trust policy to a single project
+
+A platform team often wants **one** trust policy that admits the whole org's CI — checked into IaC, audited once — and lets individual workflows narrow the issued token to a single project at runtime. To do this:
+
+1. Create the trust policy in Logfire **without binding it to a project** (Settings → OIDC Trust Policies → leave "Project" empty). The policy is then valid for every project in the org.
+2. In each workflow, pass the target project via the action's `project` input.
+
+```yaml
+# Workflow A — narrowed to `frontend`
+- uses: jirikuncar/logfire-github-action@main
+  with:
+    organization: myorg
+    project: frontend
+    scopes: project:write_otlp
+```
+
+```yaml
+# Workflow B — same org, same trust policy, different project
+- uses: jirikuncar/logfire-github-action@main
+  with:
+    organization: myorg
+    project: backend
+    scopes: project:write_otlp
+```
+
+Under the hood the action sends the audience as `{audience}/{organization}/{project}`, and the backend pins the issued workload JWT to that one project. The token issued for `frontend` is rejected (HTTP 403) the moment it's used against any other project in the org — even though the trust policy itself remains org-wide.
+
+Important boundaries:
+
+- **Downscope only.** If the trust policy is *already* bound to a project, passing a different project here is rejected (`invalid_target`). You can pass the same project as a no-op or omit it.
+- **Org-wide token.** Omitting the `project` input against an org-wide policy keeps the issued token org-wide — useful for org-spanning workflows, but consider whether a project-scoped token would be a tighter fit. Resource servers that require a project binding (e.g. the OTLP intake) will reject org-wide tokens.
+- **The project must exist in the same org.** A typo in the slug surfaces as `invalid_target` at exchange time rather than as a confusing scope error later.
+
+### Gateway proxy
+
+If the trust policy grants `project:gateway_proxy`, the same workload token authenticates LLM calls through `<logfire>/proxy/<provider>/...` — no per-provider API key needed in CI.
+
+```yaml
+- id: logfire
+  uses: jirikuncar/logfire-github-action@main
+  with:
+    organization: myorg
+    project: myapp
+    scopes: project:gateway_proxy
+
+- run: |
+    curl -sf "${{ steps.logfire.outputs.logfire-url }}/proxy/openai/v1/chat/completions" \
+      -H "Authorization: Bearer ${{ steps.logfire.outputs.token }}" \
+      -H 'Content-Type: application/json' \
+      -d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "ping"}]}'
+```
+
+To run several Logfire surfaces from the same workflow, grant all the needed scopes on the trust policy and wire the same `outputs.token` to each step.
 
 ## Matrix Workflows
 
-In a matrix strategy, `GITHUB_JOB` is the same across all matrix entries. Pass the matrix context via `job-id` to get unique span IDs per combination:
+`GITHUB_JOB` collapses across matrix entries. Pass the matrix context via `job-id` for unique span IDs per combination:
 
 ```yaml
 jobs:
@@ -119,7 +194,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: jirikuncar/logfire-github-action@main
+      - id: logfire
+        uses: jirikuncar/logfire-github-action@main
         with:
           organization: myorg
           project: myapp
@@ -131,57 +207,13 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[test]"
       - run: pytest --logfire
-```
-
-Each matrix combination appears as a distinct job span in the Logfire trace.
-
-## AI Evals Example
-
-Run Pydantic Evals against multiple LLM models with full observability — every model call, token cost, and evaluation score traced as spans:
-
-```yaml
-name: AI Evals
-on:
-  workflow_dispatch:
-    inputs:
-      model:
-        description: 'Model to evaluate'
-        default: 'openai:gpt-4o'
-
-permissions:
-  id-token: write
-
-jobs:
-  eval:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: jirikuncar/logfire-github-action@main
-        with:
-          organization: myorg
-          project: ai-evals
-          region: eu
-          token-ttl-seconds: 1800
-
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - run: pip install -e ".[evals]"
-      - run: python run_evals.py --model ${{ inputs.model }}
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LOGFIRE_TOKEN: ${{ steps.logfire.outputs.token }}
+          LOGFIRE_BASE_URL: ${{ steps.logfire.outputs.logfire-url }}
+          TRACEPARENT: ${{ steps.logfire.outputs.traceparent }}
 ```
 
-The logfire SDK and `logfire.instrument_pydantic_ai()` automatically send all eval spans under the `TRACEPARENT` set by the action.
-
-## Token Lifecycle
-
-1. **Main step**: Fetches GitHub OIDC JWT, exchanges it for short-lived Logfire tokens, exports env vars
-2. **Post step** (automatic, runs on `always()`): Revokes all issued tokens — write token deleted from DB, JWT added to Redis denylist
-
-No manual cleanup step needed. Tokens are revoked even if the job fails.
+Each matrix combination shows up as a distinct job span in the Logfire trace.
 
 ## Distributed Tracing
 
@@ -189,319 +221,30 @@ The action computes deterministic trace/span IDs from the GitHub run context:
 
 ```
 trace_id = SHA-256("logfire:github:trace:{run_id}:{run_attempt}")[0:32]
-job_span  = SHA-256("logfire:github:job:{run_id}:{run_attempt}:{job_id}")[0:16]
+job_span = SHA-256("logfire:github:job:{run_id}:{run_attempt}:{job_id}")[0:16]
 ```
 
-This enables:
-- Webhook spans (workflow_run, workflow_job) and SDK spans to share the same trace
-- `TRACEPARENT` auto-propagation to all logfire SDK calls in subsequent steps
-- Cross-job correlation within the same workflow run
+Wiring `outputs.traceparent` into the consuming step's environment as `TRACEPARENT` lets webhook spans (`workflow_run`, `workflow_job`) and SDK spans share the same trace, propagates the parent to every subsequent SDK call, and gives you cross-job correlation within a workflow run.
+
+## Reliability & Networking
+
+Both the GitHub OIDC request and the Logfire token exchange (and the post-job revocation) go through a small built-in HTTP client with:
+
+- **Per-request timeout** (`request-timeout`, default 10s) — a stalled connection is aborted rather than hanging until the job-level timeout.
+- **Retry with jittered exponential backoff** (`max-retries`, default 3) on transient failures: network errors, request timeouts, and HTTP `408`/`429`/`5xx`. A `4xx` policy rejection (e.g. `invalid_scope`, `invalid_target`) is **not** retried — it fails fast. Set `max-retries: 0` to disable.
+- **Proxy support** — set `proxy` explicitly, or rely on the standard `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` environment variables (Node's `https` ignores these by default). HTTPS targets are reached via a `CONNECT` tunnel.
+
+```yaml
+- uses: jirikuncar/logfire-github-action@main
+  with:
+    organization: myorg
+    project: myapp
+    max-retries: 5
+    request-timeout: 20
+    proxy: http://proxy.internal:8080
+```
 
 ## Prerequisites
 
-1. **Trust policy** configured in Logfire organization settings
-2. **`id-token: write`** permission in workflow
-3. **Logfire project** (for write token / SDK integration)
-
-## Environment Variables Set
-
-| Variable | Condition | Value |
-|----------|-----------|-------|
-| `LOGFIRE_TOKEN` | `export-token: true` (default) | Write token (if project scoped) or JWT |
-| `LOGFIRE_BASE_URL` | `export-token: true` (default) | Resolved Logfire API URL |
-| `LOGFIRE_SEND_TO_LOGFIRE` | `export-token: true` (default) | `true` |
-| `TRACEPARENT` | `export-traceparent: true` (default) | W3C traceparent header |
-
-## Local Testing
-
-You can test the full OIDC exchange flow locally without a real GitHub Actions runner. The helper script at `scripts/test_github_oidc_local.py` starts a mock OIDC provider that signs JWTs with a locally-generated RSA key pair.
-
-### Prerequisites
-
-```bash
-# Start postgres and redis (if not already running)
-make compose-up-ff-companion
-
-# Ensure PyJWT with RSA support is available
-uv pip install PyJWT cryptography
-```
-
-### Step 1: Start the mock OIDC provider
-
-```bash
-uv run python scripts/test_github_oidc_local.py serve
-```
-
-This starts a local JWKS server at `http://localhost:9099` that serves:
-- `/.well-known/jwks` — the RSA public key in JWK format
-- `/.well-known/openid-configuration` — OIDC discovery document
-
-### Step 2: Start the backend with OIDC pointed at the mock
-
-```bash
-GITHUB_OIDC_ISSUER=http://localhost:9099 \
-GITHUB_OIDC_JWKS_URL=http://localhost:9099/.well-known/jwks \
-GITHUB_OIDC_AUDIENCE=http://localhost:9000 \
-uv run python src/services/logfire-backend/local.py
-```
-
-The backend starts on port 9000 and validates JWTs against the mock provider instead of GitHub.
-
-### Step 3: Trust policy (auto-created)
-
-The backend bootstrap (`local.py`) automatically creates a default trust policy for the `e2e-test` org:
-
-| Field | Value |
-|-------|-------|
-| Name | `Local Development` |
-| `repository_owner` | `pydantic` |
-| `repository` | `NULL` (any pydantic/* repo) |
-| `ref_pattern` | `NULL` (any branch/tag) |
-| Scopes | `project:read`, `project:write` |
-| TTL | 3600s (1 hour) |
-
-If you need a different policy (e.g., for a non-pydantic repo), add one manually:
-
-```bash
-docker exec -it platform-postgres-1 psql -U postgres -d crud -c "
-  INSERT INTO logfire.github_oidc_trust_policies (
-    organization_id, name, repository, repository_owner,
-    scopes, token_ttl_seconds, created_by
-  )
-  SELECT o.id, 'Custom Policy', 'your-org/your-repo', 'your-org',
-         ARRAY['project:read','project:write'], 3600, u.id
-  FROM logfire.organizations o, logfire.users u
-  WHERE o.organization_name = 'e2e-test'
-  LIMIT 1;
-"
-```
-
-Or see `uv run python scripts/test_github_oidc_local.py create-policy` for UI and curl alternatives.
-
-### Step 4: Exchange a token
-
-```bash
-uv run python scripts/test_github_oidc_local.py exchange \
-    --org e2e-test \
-    --repo pydantic/logfire
-```
-
-This mints a JWT, sends it to `POST /api/github/oidc/exchange`, and prints the result including export commands for `LOGFIRE_TOKEN` and `TRACEPARENT`.
-
-### Step-by-step alternative
-
-If you want to control each step:
-
-```bash
-# Mint a JWT only (prints the raw token)
-uv run python scripts/test_github_oidc_local.py mint-jwt \
-    --repo pydantic/logfire \
-    --ref refs/heads/main
-
-# Exchange it manually
-curl -s -X POST http://localhost:9000/api/github/oidc/exchange \
-    -H 'Content-Type: application/json' \
-    -d '{"token": "<paste-jwt-here>", "organization": "e2e-test"}' | jq .
-```
-
-### Testing different scenarios
-
-```bash
-# Different repository
-uv run python scripts/test_github_oidc_local.py exchange \
-    --org e2e-test --repo other-org/other-repo
-
-# With project scoping (creates a write token)
-uv run python scripts/test_github_oidc_local.py exchange \
-    --org e2e-test --project my-project --repo pydantic/logfire
-
-# With specific scopes
-uv run python scripts/test_github_oidc_local.py exchange \
-    --org e2e-test --repo pydantic/logfire --scopes project:read
-
-# Simulating a specific ref (to test ref_pattern matching)
-uv run python scripts/test_github_oidc_local.py exchange \
-    --org e2e-test --repo pydantic/logfire --ref refs/tags/v1.0.0
-
-# Test revocation
-curl -s -X POST http://localhost:9000/api/github/oidc/revoke \
-    -H 'Content-Type: application/json' \
-    -d '{"logfire_token": "<token>", "access_token": "<jwt>"}'
-```
-
-### Testing webhooks
-
-To test the webhook endpoint locally:
-
-```bash
-# Create a webhook config
-docker exec -it platform-postgres-1 psql -U postgres -d crud -c "
-  INSERT INTO logfire.github_webhook_configs (
-    organization_id, project_id, webhook_secret_hash, track_workflow_runs, track_workflow_jobs
-  )
-  SELECT o.id, p.id, 'my-webhook-secret', true, true
-  FROM logfire.organizations o
-  JOIN logfire.projects p ON p.organization_id = o.id
-  WHERE o.organization_name = 'e2e-test'
-  LIMIT 1;
-"
-
-# Send a fake workflow_run event
-curl -s -X POST http://localhost:9000/api/github/webhooks/events \
-    -H 'Content-Type: application/json' \
-    -H 'X-GitHub-Event: workflow_run' \
-    -H "X-Hub-Signature-256: sha256=$(echo -n '{"action":"completed","workflow_run":{"id":123,"run_attempt":1,"name":"CI","conclusion":"success","status":"completed","head_branch":"main","head_sha":"abc123","event":"push","actor":{"login":"test"},"html_url":"https://github.com/pydantic/logfire/actions/runs/123","run_started_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:05:00Z"},"repository":{"full_name":"pydantic/logfire"}}' | openssl dgst -sha256 -hmac 'my-webhook-secret' | awk '{print $2}')" \
-    -H 'X-GitHub-Delivery: test-delivery-1' \
-    -d '{"action":"completed","workflow_run":{"id":123,"run_attempt":1,"name":"CI","conclusion":"success","status":"completed","head_branch":"main","head_sha":"abc123","event":"push","actor":{"login":"test"},"html_url":"https://github.com/pydantic/logfire/actions/runs/123","run_started_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:05:00Z"},"repository":{"full_name":"pydantic/logfire"}}'
-```
-
-### Cleaning up
-
-The generated RSA key pair is stored in `scripts/.oidc-test-keys/` (gitignored). Delete it to force regeneration:
-
-```bash
-rm -rf scripts/.oidc-test-keys/
-```
-
-## Testing with Real GitHub (ngrok)
-
-To test the full end-to-end flow with real GitHub Actions OIDC tokens, you need to expose your local backend to the internet so GitHub's runners can reach it. [ngrok](https://ngrok.com/) is the simplest way to do this.
-
-### Prerequisites
-
-- [ngrok](https://ngrok.com/download) installed and authenticated (`ngrok config add-authtoken <token>`)
-- Docker Compose services running: `make compose-up-ff-companion`
-- A GitHub repository where you can create workflows
-
-### Step 1: Start the backend
-
-Start the backend normally — no mock OIDC overrides needed since we're using real GitHub tokens:
-
-```bash
-uv run python src/services/logfire-backend/local.py
-```
-
-The backend starts on port 9000 with the default `GITHUB_OIDC_ISSUER=https://token.actions.githubusercontent.com`.
-
-### Step 2: Start ngrok
-
-```bash
-ngrok http 9000
-```
-
-ngrok prints a public URL like `https://a1b2c3d4.ngrok-free.app`. Copy this — it's your `LOGFIRE_URL` for API routing.
-
-The OIDC audience is always `https://logfire.pydantic.dev` (the default), so no backend restart is needed.
-
-### Step 3: Trust policy
-
-The default bootstrap policy already matches any `pydantic/*` repository. If your test repo is under a different owner, create an additional policy:
-
-```bash
-docker exec -it platform-postgres-1 psql -U postgres -d crud -c "
-  INSERT INTO logfire.github_oidc_trust_policies (
-    organization_id, name, repository, repository_owner,
-    scopes, token_ttl_seconds, created_by
-  )
-  SELECT o.id, 'ngrok Test', 'YOUR_ORG/YOUR_REPO', 'YOUR_ORG',
-         ARRAY['project:read','project:write'], 3600, u.id
-  FROM logfire.organizations o, logfire.users u
-  WHERE o.organization_name = 'e2e-test'
-  LIMIT 1;
-"
-```
-
-### Step 5: Create a test workflow
-
-In your GitHub repository, create `.github/workflows/test-oidc.yml`:
-
-```yaml
-name: Test Logfire OIDC
-on: workflow_dispatch
-
-permissions:
-  id-token: write
-  contents: read
-
-jobs:
-  test-oidc:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Logfire OIDC Auth
-        uses: jirikuncar/logfire-github-action@<your-branch>
-        id: logfire
-        with:
-          organization: e2e-test
-          url: https://a1b2c3d4.ngrok-free.app
-
-      - name: Verify tokens
-        run: |
-          echo "Access token present: $([ -n '${{ steps.logfire.outputs.token }}' ] && echo yes || echo no)"
-          echo "Logfire token present: $([ -n '${{ steps.logfire.outputs.logfire-token }}' ] && echo yes || echo no)"
-          echo "Traceparent: ${{ steps.logfire.outputs.traceparent }}"
-          echo "Expires in: ${{ steps.logfire.outputs.expires-in }}s"
-          echo "Scopes: ${{ steps.logfire.outputs.scopes }}"
-          echo "LOGFIRE_TOKEN env set: $([ -n "$LOGFIRE_TOKEN" ] && echo yes || echo no)"
-          echo "TRACEPARENT env set: $([ -n "$TRACEPARENT" ] && echo yes || echo no)"
-
-      - name: Test SDK integration (optional)
-        run: |
-          pip install logfire
-          python -c "
-          import logfire
-          logfire.configure()
-          with logfire.span('oidc-test-span'):
-              logfire.info('Hello from GitHub Actions via OIDC')
-          "
-```
-
-Replace `<your-branch>` with the branch containing the action code (e.g., `claude/github-actions-oidc-integration-HtCFX`).
-
-### Step 6: Trigger the workflow
-
-Go to the repository's Actions tab and manually dispatch the "Test Logfire OIDC" workflow. Watch the logs to confirm:
-
-1. GitHub OIDC token was fetched
-2. Exchange with your local backend succeeded (you'll see the request in ngrok's web inspector at `http://localhost:4040`)
-3. Environment variables were exported
-4. Post-step revocation ran
-
-### Debugging
-
-**ngrok web inspector:** Open `http://localhost:4040` in your browser to see all HTTP requests hitting your local backend, including full request/response bodies.
-
-**Common issues:**
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| `Invalid audience` (401) | Backend `GITHUB_OIDC_AUDIENCE` doesn't match | Ensure backend uses default `https://logfire.pydantic.dev` |
-| `No trust policy matches` (403) | Trust policy `repository` doesn't match | Check the policy matches `owner/repo` exactly |
-| `Connection refused` | ngrok tunnel not running or wrong port | Verify ngrok is forwarding to port 9000 |
-| `502 Bad Gateway` | Backend not running | Start the backend first, then ngrok |
-| Exchange works but SDK fails | `LOGFIRE_BASE_URL` points to ngrok but SDK needs different host | Check the action's `url` input matches the ngrok URL |
-
-### Testing webhooks with ngrok
-
-ngrok also works for testing real GitHub webhooks:
-
-1. In your GitHub repository, go to Settings > Webhooks > Add webhook
-2. Set Payload URL to `https://a1b2c3d4.ngrok-free.app/api/github/webhooks/events`
-3. Set Content type to `application/json`
-4. Set Secret to a value, then create a matching webhook config in the DB:
-
-```bash
-docker exec -it platform-postgres-1 psql -U postgres -d crud -c "
-  INSERT INTO logfire.github_webhook_configs (
-    organization_id, project_id, webhook_secret_hash,
-    track_workflow_runs, track_workflow_jobs
-  )
-  SELECT o.id, p.id, '<your-webhook-secret>', true, true
-  FROM logfire.organizations o
-  JOIN logfire.projects p ON p.organization_id = o.id
-  WHERE o.organization_name = 'e2e-test'
-  LIMIT 1;
-"
-```
-
-5. Select events: `Workflow runs` and `Workflow jobs`
-6. Trigger a workflow — webhook events will appear in the ngrok inspector and create spans in the backend
+1. An **OIDC trust policy** configured in your Logfire organization (Settings → OIDC Trust Policies). The policy decides which repos/refs/environments may exchange a token and what scopes the issued token carries.
+2. **`id-token: write`** permission in the workflow.
