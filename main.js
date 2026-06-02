@@ -198,14 +198,16 @@ async function main() {
     setOutput('trace-id', traceId);
     debug(`Traceparent: ${traceparent}`);
 
-    // 3. Resolve the audience. Two mutually-exclusive modes:
-    //    - Explicit `audience`: used verbatim for both the OIDC JWT `aud`
-    //      claim and the RFC 8693 exchange. It must already encode whatever
+    // 3. Resolve the audience. The OIDC JWT `aud` claim and the RFC 8693
+    //    exchange audience are always set to the same value — the backend's
+    //    audience check requires them to match (or the JWT aud to be a path
+    //    extension of the exchange audience). Two mutually-exclusive modes:
+    //    - Explicit `audience`: used verbatim. Must already encode whatever
     //      org/project path the backend expects, so `organization`/`project`
     //      are rejected here to avoid an ambiguous double-encoding.
-    //    - Otherwise: the OIDC `aud` claim is the resolved Logfire URL and the
-    //      exchange audience encodes the org (+ optional project) as a path,
-    //      which the backend parses to route to the right org/project.
+    //    - Otherwise: the audience is built from `organization` (+ optional
+    //      `project`) as a path under the resolved Logfire URL, which the
+    //      backend parses to route to the right org/project.
     const audienceInput = getInput('audience');
     const organization = getInput('organization');
     const project = getInput('project');
@@ -227,10 +229,10 @@ async function main() {
       if (!organization) {
         throw new Error('Input "organization" is required (unless a full "audience" is provided)');
       }
-      oidcAudience = resolvedUrl;
       exchangeAudience = project
         ? `${resolvedUrl}/${organization}/${project}`
         : `${resolvedUrl}/${organization}`;
+      oidcAudience = exchangeAudience;
     }
 
     // 4. Fetch the GitHub OIDC JWT
