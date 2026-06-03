@@ -32,6 +32,8 @@ function makeSelfSignedCert(): { dir: string; key: Buffer; cert: Buffer } {
       '1',
       '-subj',
       '/CN=localhost',
+      '-addext',
+      'subjectAltName=DNS:localhost,IP:127.0.0.1',
     ],
     { stdio: 'ignore' },
   );
@@ -222,26 +224,20 @@ describe('requestWithRetry', () => {
 });
 
 describe('requestWithRetry over a CONNECT proxy (TLS tunnel)', () => {
-  const prev = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-  let tls: { dir: string; key: Buffer; cert: Buffer };
+  let cert: { dir: string; key: Buffer; cert: Buffer };
 
   beforeAll(() => {
-    // The upstream uses a freshly generated self-signed cert; relax verification
-    // for this suite only so we exercise the real CONNECT + TLS-over-tunnel path.
-    tls = makeSelfSignedCert();
-    process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+    cert = makeSelfSignedCert();
   });
   afterAll(() => {
-    if (prev === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-    else process.env.NODE_TLS_REJECT_UNAUTHORIZED = prev;
-    fs.rmSync(tls.dir, { recursive: true, force: true });
+    fs.rmSync(cert.dir, { recursive: true, force: true });
   });
 
   it('tunnels an https request through an http CONNECT proxy', async () => {
     const upstream = https.createServer(
       {
-        key: tls.key,
-        cert: tls.cert,
+        key: cert.key,
+        cert: cert.cert,
       },
       (_req, res) => {
         res.writeHead(200, { 'content-type': 'text/plain' });
@@ -266,11 +262,15 @@ describe('requestWithRetry over a CONNECT proxy (TLS tunnel)', () => {
     });
     const proxyPort = await listen(proxy);
 
-    const r = await requestWithRetry(`https://127.0.0.1:${upPort}/`, { method: 'GET' }, undefined, {
-      proxy: `http://127.0.0.1:${proxyPort}`,
-      timeoutMs: 5000,
-      maxRetries: 1,
-    });
+    // Connect to 127.0.0.1 (unambiguous, no DNS/IPv6 flakiness) but verify
+    // against the generated CA with servername 'localhost' — exercises real TLS
+    // verification through the tunnel without disabling it globally.
+    const r = await requestWithRetry(
+      `https://127.0.0.1:${upPort}/`,
+      { method: 'GET', ca: cert.cert, servername: 'localhost' },
+      undefined,
+      { proxy: `http://127.0.0.1:${proxyPort}`, timeoutMs: 5000, maxRetries: 1 },
+    );
 
     expect(r.statusCode).toBe(200);
     expect(r.body).toBe('tunneled-ok');

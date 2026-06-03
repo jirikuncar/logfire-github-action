@@ -196,7 +196,22 @@ export function makeRequest(
         fail(new Error(`Proxy CONNECT to ${target.host} failed (HTTP ${res.statusCode})`));
         return;
       }
-      const tlsSocket = tls.connect({ socket, servername: target.hostname });
+      // SNI must not be an IP literal (RFC 6066); prefer an explicit
+      // options.servername, else the hostname, else omit it for IPs. Forward
+      // the caller's TLS trust settings so the tunneled connection verifies the
+      // same way a direct https request would.
+      const servername =
+        typeof options.servername === 'string'
+          ? options.servername
+          : net.isIP(target.hostname)
+            ? undefined
+            : target.hostname;
+      const tlsSocket = tls.connect({
+        socket,
+        servername,
+        ca: options.ca,
+        rejectUnauthorized: options.rejectUnauthorized,
+      });
       tlsSocket.on('error', fail);
       const req = https.request(
         targetUrl,

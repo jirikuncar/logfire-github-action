@@ -61,7 +61,7 @@ The HTTP client is covered by `test/http-client.test.ts`, which spins up local s
 - proxy resolution and `NO_PROXY` matching (`getProxyForUrl` / `inNoProxy`);
 - retry on `5xx`, no-retry on `4xx`, timeout-throws, and timeout-then-retry behavior;
 - plain-HTTP proxying (absolute-form request path);
-- HTTPS through an `http` `CONNECT` proxy (TLS-over-tunnel). The suite generates a throwaway self-signed cert (`CN=localhost`) into a temp dir at setup via `openssl` — no key material is committed — and removes it afterward. It sets `NODE_TLS_REJECT_UNAUTHORIZED=0` for that suite only (restored after) so the generated cert is accepted.
+- HTTPS through an `http` `CONNECT` proxy (TLS-over-tunnel). The suite generates a throwaway self-signed cert (`CN=localhost`, with `localhost`/`127.0.0.1` SANs) into a temp dir at setup via `openssl` — no key material is committed — and removes it afterward. It verifies against that cert by passing it as `ca` (with `servername: 'localhost'`), exercising real TLS verification through the tunnel rather than disabling it.
 
 > The CONNECT-tunnel suite shells out to `openssl` (present on the dev machines and `ubuntu-latest`). If `openssl` isn't on `PATH`, that suite will fail; the rest of the suite has no such requirement.
 

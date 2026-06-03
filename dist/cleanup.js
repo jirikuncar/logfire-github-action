@@ -25,6 +25,7 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 // src/http-client.ts
 var http = __toESM(require("node:http"));
 var https = __toESM(require("node:https"));
+var net = __toESM(require("node:net"));
 var tls = __toESM(require("node:tls"));
 var DEFAULT_TIMEOUT_MS = 1e4;
 var DEFAULT_MAX_RETRIES = 3;
@@ -143,7 +144,13 @@ function makeRequest(targetUrl, options, body, proxyUrl, timeoutMs) {
         fail(new Error(`Proxy CONNECT to ${target.host} failed (HTTP ${res.statusCode})`));
         return;
       }
-      const tlsSocket = tls.connect({ socket, servername: target.hostname });
+      const servername = typeof options.servername === "string" ? options.servername : net.isIP(target.hostname) ? void 0 : target.hostname;
+      const tlsSocket = tls.connect({
+        socket,
+        servername,
+        ca: options.ca,
+        rejectUnauthorized: options.rejectUnauthorized
+      });
       tlsSocket.on("error", fail);
       const req = https.request(
         targetUrl,
