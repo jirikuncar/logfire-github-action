@@ -22,9 +22,8 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
   mod
 ));
 
-// src/main.ts
+// src/run.ts
 var crypto = __toESM(require("node:crypto"));
-var fs = __toESM(require("node:fs"));
 
 // src/http-client.ts
 var http = __toESM(require("node:http"));
@@ -49,6 +48,14 @@ function inNoProxy(hostname, port, noProxy) {
     if (!host) return false;
     return hostname === host || hostname.endsWith(`.${host}`);
   });
+}
+function resolveProxyPort(proxy) {
+  if (proxy.port) return Number(proxy.port);
+  return proxy.protocol === "https:" ? 443 : 80;
+}
+function selectServername(optionServername, hostname) {
+  if (typeof optionServername === "string") return optionServername;
+  return net.isIP(hostname) ? void 0 : hostname;
 }
 function getProxyForUrl(targetUrl, env = process.env) {
   let target;
@@ -113,7 +120,7 @@ function makeRequest(targetUrl, options, body, proxyUrl, timeoutMs) {
       const creds = `${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`;
       proxyHeaders["Proxy-Authorization"] = `Basic ${Buffer.from(creds).toString("base64")}`;
     }
-    const proxyPort = proxy.port || (proxy.protocol === "https:" ? 443 : 80);
+    const proxyPort = resolveProxyPort(proxy);
     if (!isHttps) {
       const req = http.request(
         {
@@ -148,19 +155,19 @@ function makeRequest(targetUrl, options, body, proxyUrl, timeoutMs) {
         fail(new Error(`Proxy CONNECT to ${target.host} failed (HTTP ${res.statusCode})`));
         return;
       }
-      const servername = typeof options.servername === "string" ? options.servername : net.isIP(target.hostname) ? void 0 : target.hostname;
-      const tlsSocket = tls.connect({
-        socket,
-        servername,
-        ca: options.ca,
-        rejectUnauthorized: options.rejectUnauthorized
+      const servername = selectServername(options.servername, target.hostname);
+      const tunnelAgent = new https.Agent();
+      tunnelAgent.createConnection = (() => {
+        const tlsSocket = tls.connect({
+          socket,
+          servername,
+          ca: options.ca,
+          rejectUnauthorized: options.rejectUnauthorized
+        });
+        tlsSocket.on("error", fail);
+        return tlsSocket;
       });
-      tlsSocket.on("error", fail);
-      const req = https.request(
-        targetUrl,
-        { ...options, agent: false, createConnection: () => tlsSocket },
-        onResponse
-      );
+      const req = https.request(targetUrl, { ...options, agent: tunnelAgent }, onResponse);
       wire(req);
     });
     connectReq.end();
@@ -210,7 +217,8 @@ async function requestWithRetry(url, options, body, opts = {}) {
   }
 }
 
-// src/main.ts
+// src/actions.ts
+var fs = __toESM(require("node:fs"));
 function getInput(name) {
   const val = process.env[`INPUT_${name.replace(/-/g, "_").toUpperCase()}`] || "";
   return val.trim();
@@ -241,6 +249,11 @@ function setFailed(message) {
 function debug(message) {
   console.log(`::debug::${message}`);
 }
+function info(message) {
+  console.log(message);
+}
+
+// src/run.ts
 var TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
 var JWT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:jwt";
 async function exchangeToken(tokenUrl, { subjectToken, audience, scope }, httpOpts) {
@@ -332,75 +345,86 @@ function resolveUrl(region, url) {
   }
   return REGION_URLS.us;
 }
-async function main() {
-  try {
-    const region = getInput("region");
-    const url = getInput("url");
-    const resolvedUrl = resolveUrl(region, url);
-    setOutput("logfire-url", resolvedUrl);
-    debug(`Resolved Logfire URL: ${resolvedUrl}`);
-    const maxRetriesInput = parseInt(getInput("max-retries"), 10);
-    const timeoutInput = parseInt(getInput("request-timeout"), 10);
-    const httpOpts = {
-      maxRetries: Number.isNaN(maxRetriesInput) ? void 0 : Math.max(0, maxRetriesInput),
-      timeoutMs: Number.isNaN(timeoutInput) ? void 0 : Math.max(1, timeoutInput) * 1e3,
-      proxy: getInput("proxy") || void 0,
-      onRetry: (info) => debug(`Retry ${info.attempt}/${info.maxRetries} in ${info.delayMs}ms (${info.reason})`)
-    };
-    const runId = process.env.GITHUB_RUN_ID || "";
-    const runAttempt = process.env.GITHUB_RUN_ATTEMPT || "1";
-    const jobId = getInput("job-id") || process.env.GITHUB_JOB || "";
-    const traceId = computeTraceId(runId, runAttempt);
-    const jobSpanId = computeJobSpanId(runId, runAttempt, jobId);
-    const traceparent = `00-${traceId}-${jobSpanId}-01`;
-    setOutput("traceparent", traceparent);
-    setOutput("trace-id", traceId);
-    debug(`Traceparent: ${traceparent}`);
-    const audienceInput = getInput("audience");
-    const organization = getInput("organization");
-    const project = getInput("project");
-    if (audienceInput && (organization || project)) {
-      throw new Error(
-        'Input "audience" cannot be combined with "organization" or "project". Provide a full audience that already encodes the org/project path, or omit "audience" and pass "organization" (+ optional "project") instead.'
-      );
-    }
-    let oidcAudience;
-    let exchangeAudience;
-    if (audienceInput) {
-      oidcAudience = audienceInput;
-      exchangeAudience = audienceInput;
-    } else {
-      if (!organization) {
-        throw new Error('Input "organization" is required (unless a full "audience" is provided)');
-      }
-      exchangeAudience = project ? `${resolvedUrl}/${organization}/${project}` : `${resolvedUrl}/${organization}`;
-      oidcAudience = exchangeAudience;
-    }
-    const subjectToken = await getIDToken(oidcAudience, httpOpts);
-    setSecret(subjectToken);
-    const scopesInput = getInput("scopes");
-    const scope = scopesInput ? scopesInput.split(/\s+/).filter(Boolean).join(" ") : "";
-    const result = await exchangeToken(
-      `${resolvedUrl}/api/oauth/token`,
-      { subjectToken, audience: exchangeAudience, scope },
-      httpOpts
+function resolveAudience({
+  audienceInput,
+  organization,
+  project,
+  resolvedUrl
+}) {
+  if (audienceInput && (organization || project)) {
+    throw new Error(
+      'Input "audience" cannot be combined with "organization" or "project". Provide a full audience that already encodes the org/project path, or omit "audience" and pass "organization" (+ optional "project") instead.'
     );
-    const accessToken = result.access_token;
-    const expiresIn = result.expires_in;
-    const grantedScopes = result.scope || "";
-    setSecret(accessToken);
-    setOutput("token", accessToken);
-    setOutput("expires-in", String(expiresIn));
-    setOutput("scopes", grantedScopes);
-    const skipCleanup = getInput("skip-cleanup").toLowerCase() === "true";
-    saveState("access_token", accessToken);
-    saveState("logfire_url", resolvedUrl);
-    saveState("skip_cleanup", skipCleanup ? "true" : "");
-    console.log(
-      `Logfire OIDC authentication successful (expires in ${expiresIn}s, scopes: ${grantedScopes})`
-    );
-  } catch (error) {
-    setFailed(error.message);
   }
+  if (audienceInput) {
+    return { oidcAudience: audienceInput, exchangeAudience: audienceInput };
+  }
+  if (!organization) {
+    throw new Error('Input "organization" is required (unless a full "audience" is provided)');
+  }
+  const exchangeAudience = project ? `${resolvedUrl}/${organization}/${project}` : `${resolvedUrl}/${organization}`;
+  return { oidcAudience: exchangeAudience, exchangeAudience };
 }
-void main();
+function parseScopes(scopesInput) {
+  return scopesInput ? scopesInput.split(/\s+/).filter(Boolean).join(" ") : "";
+}
+function readHttpOpts() {
+  const maxRetriesInput = parseInt(getInput("max-retries"), 10);
+  const timeoutInput = parseInt(getInput("request-timeout"), 10);
+  return {
+    maxRetries: Number.isNaN(maxRetriesInput) ? void 0 : Math.max(0, maxRetriesInput),
+    timeoutMs: Number.isNaN(timeoutInput) ? void 0 : Math.max(1, timeoutInput) * 1e3,
+    proxy: getInput("proxy") || void 0,
+    onRetry: (r) => debug(`Retry ${r.attempt}/${r.maxRetries} in ${r.delayMs}ms (${r.reason})`)
+  };
+}
+async function run() {
+  const region = getInput("region");
+  const url = getInput("url");
+  const resolvedUrl = resolveUrl(region, url);
+  setOutput("logfire-url", resolvedUrl);
+  debug(`Resolved Logfire URL: ${resolvedUrl}`);
+  const httpOpts = readHttpOpts();
+  const runId = process.env.GITHUB_RUN_ID || "";
+  const runAttempt = process.env.GITHUB_RUN_ATTEMPT || "1";
+  const jobId = getInput("job-id") || process.env.GITHUB_JOB || "";
+  const traceId = computeTraceId(runId, runAttempt);
+  const jobSpanId = computeJobSpanId(runId, runAttempt, jobId);
+  const traceparent = `00-${traceId}-${jobSpanId}-01`;
+  setOutput("traceparent", traceparent);
+  setOutput("trace-id", traceId);
+  debug(`Traceparent: ${traceparent}`);
+  const { oidcAudience, exchangeAudience } = resolveAudience({
+    audienceInput: getInput("audience"),
+    organization: getInput("organization"),
+    project: getInput("project"),
+    resolvedUrl
+  });
+  const subjectToken = await getIDToken(oidcAudience, httpOpts);
+  setSecret(subjectToken);
+  const scope = parseScopes(getInput("scopes"));
+  const result = await exchangeToken(
+    `${resolvedUrl}/api/oauth/token`,
+    { subjectToken, audience: exchangeAudience, scope },
+    httpOpts
+  );
+  const accessToken = result.access_token;
+  const expiresIn = result.expires_in;
+  const grantedScopes = result.scope || "";
+  setSecret(accessToken);
+  setOutput("token", accessToken);
+  setOutput("expires-in", String(expiresIn));
+  setOutput("scopes", grantedScopes);
+  const skipCleanup = getInput("skip-cleanup").toLowerCase() === "true";
+  saveState("access_token", accessToken);
+  saveState("logfire_url", resolvedUrl);
+  saveState("skip_cleanup", skipCleanup ? "true" : "");
+  info(
+    `Logfire OIDC authentication successful (expires in ${expiresIn}s, scopes: ${grantedScopes})`
+  );
+}
+
+// src/main.ts
+void run().catch((error) => {
+  setFailed(error instanceof Error ? error.message : String(error));
+});

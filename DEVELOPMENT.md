@@ -16,12 +16,17 @@ pnpm install
 
 | Path                 | Purpose                                                                      |
 | -------------------- | ---------------------------------------------------------------------------- |
-| `src/main.ts`        | Main entry point — OIDC fetch + RFC 8693 token exchange                      |
-| `src/cleanup.ts`     | `post` entry point — RFC 7009 token revocation                               |
+| `src/main.ts`        | `runs.main` entry shim — calls `run()`, maps errors to `setFailed`           |
+| `src/cleanup.ts`     | `runs.post` entry shim — calls `post()`                                      |
+| `src/run.ts`         | Main logic: OIDC fetch + RFC 8693 exchange, plus pure helpers                |
+| `src/post.ts`        | Cleanup logic: RFC 7009 token revocation                                     |
 | `src/http-client.ts` | Built-in HTTP client (timeout, retry/backoff, proxy/CONNECT)                 |
-| `test/`              | Vitest suite + TLS fixtures (`test/fixtures/`)                               |
+| `src/actions.ts`     | Minimal GitHub Actions toolkit shims (inputs, outputs, state, masking)       |
+| `test/`              | Vitest suite (logic + nock-mocked HTTP flows)                                |
 | `dist/`              | **Committed** bundle the runner executes (`dist/main.js`, `dist/cleanup.js`) |
 | `action.yml`         | Action metadata; `runs.main`/`runs.post` point at `dist/`                    |
+
+The entry shims (`main.ts`/`cleanup.ts`) are kept trivial so the logic in `run.ts`/`post.ts` can be imported and unit-tested without triggering a real run; they're excluded from coverage.
 
 ## Scripts
 
@@ -56,12 +61,14 @@ If `check-dist` is red, run `pnpm run build` locally and commit the result.
 
 ## Testing notes
 
-The HTTP client is covered by `test/http-client.test.ts`, which spins up local servers (no outbound network) to exercise:
+Tests live in `test/` and run with Vitest. Coverage is gated at **100%** (statements, branches, functions, lines) for everything under `src/` except the entry shims — `pnpm run coverage` (and CI) fails below that.
 
-- proxy resolution and `NO_PROXY` matching (`getProxyForUrl` / `inNoProxy`);
-- retry on `5xx`, no-retry on `4xx`, timeout-throws, and timeout-then-retry behavior;
-- plain-HTTP proxying (absolute-form request path);
-- HTTPS through an `http` `CONNECT` proxy (TLS-over-tunnel). The suite generates a throwaway self-signed cert (`CN=localhost`, with `localhost`/`127.0.0.1` SANs) into a temp dir at setup via `openssl` — no key material is committed — and removes it afterward. It verifies against that cert by passing it as `ca` (with `servername: 'localhost'`), exercising real TLS verification through the tunnel rather than disabling it.
+- `test/run.test.ts` — pure helpers (`resolveUrl`, traceparent, `resolveAudience`, `parseScopes`, `readHttpOpts`) plus the full `run()` flow with the GitHub OIDC and exchange endpoints mocked via [nock](https://github.com/nock/nock), asserting outputs/state files, secret masking, and the error paths.
+- `test/post.test.ts` — the cleanup decision branches and revoke flows (2xx success, non-2xx warn, network-error-after-retries warn, skip flag) via nock.
+- `test/actions.test.ts` — the `setFailed` workflow command.
+- `test/http-client.test.ts` — spins up local servers (no outbound network) for proxy resolution / `NO_PROXY` matching, retry on `5xx`, no-retry on `4xx`, timeout throw/retry, plain-HTTP proxying, and HTTPS through an `http` `CONNECT` proxy (TLS-over-tunnel). The tunnel test targets an unresolvable host so it only passes if the request genuinely traverses the tunnel socket.
+
+The CONNECT-tunnel suite generates a throwaway self-signed cert (`CN=localhost`, `localhost`/`127.0.0.1` SANs) into a temp dir via `openssl` at setup — no key material is committed — and verifies against it with `ca`/`servername` (real TLS verification, not disabled).
 
 > The CONNECT-tunnel suite shells out to `openssl` (present on the dev machines and `ubuntu-latest`). If `openssl` isn't on `PATH`, that suite will fail; the rest of the suite has no such requirement.
 

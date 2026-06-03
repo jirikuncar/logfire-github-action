@@ -46,6 +46,14 @@ function inNoProxy(hostname, port, noProxy) {
     return hostname === host || hostname.endsWith(`.${host}`);
   });
 }
+function resolveProxyPort(proxy) {
+  if (proxy.port) return Number(proxy.port);
+  return proxy.protocol === "https:" ? 443 : 80;
+}
+function selectServername(optionServername, hostname) {
+  if (typeof optionServername === "string") return optionServername;
+  return net.isIP(hostname) ? void 0 : hostname;
+}
 function getProxyForUrl(targetUrl, env = process.env) {
   let target;
   try {
@@ -109,7 +117,7 @@ function makeRequest(targetUrl, options, body, proxyUrl, timeoutMs) {
       const creds = `${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`;
       proxyHeaders["Proxy-Authorization"] = `Basic ${Buffer.from(creds).toString("base64")}`;
     }
-    const proxyPort = proxy.port || (proxy.protocol === "https:" ? 443 : 80);
+    const proxyPort = resolveProxyPort(proxy);
     if (!isHttps) {
       const req = http.request(
         {
@@ -144,19 +152,19 @@ function makeRequest(targetUrl, options, body, proxyUrl, timeoutMs) {
         fail(new Error(`Proxy CONNECT to ${target.host} failed (HTTP ${res.statusCode})`));
         return;
       }
-      const servername = typeof options.servername === "string" ? options.servername : net.isIP(target.hostname) ? void 0 : target.hostname;
-      const tlsSocket = tls.connect({
-        socket,
-        servername,
-        ca: options.ca,
-        rejectUnauthorized: options.rejectUnauthorized
+      const servername = selectServername(options.servername, target.hostname);
+      const tunnelAgent = new https.Agent();
+      tunnelAgent.createConnection = (() => {
+        const tlsSocket = tls.connect({
+          socket,
+          servername,
+          ca: options.ca,
+          rejectUnauthorized: options.rejectUnauthorized
+        });
+        tlsSocket.on("error", fail);
+        return tlsSocket;
       });
-      tlsSocket.on("error", fail);
-      const req = https.request(
-        targetUrl,
-        { ...options, agent: false, createConnection: () => tlsSocket },
-        onResponse
-      );
+      const req = https.request(targetUrl, { ...options, agent: tunnelAgent }, onResponse);
       wire(req);
     });
     connectReq.end();
@@ -206,7 +214,7 @@ async function requestWithRetry(url, options, body, opts = {}) {
   }
 }
 
-// src/cleanup.ts
+// src/actions.ts
 function getState(name) {
   return (process.env[`STATE_${name}`] || "").trim();
 }
@@ -216,6 +224,8 @@ function warning(message) {
 function debug(message) {
   console.log(`::debug::${message}`);
 }
+
+// src/post.ts
 async function revokeToken(revokeUrl, token) {
   const formBody = new URLSearchParams({
     token,
@@ -232,14 +242,12 @@ async function revokeToken(revokeUrl, token) {
     },
     formBody,
     {
-      onRetry: (info) => debug(
-        `Revoke retry ${info.attempt}/${info.maxRetries} in ${info.delayMs}ms (${info.reason})`
-      )
+      onRetry: (r) => debug(`Revoke retry ${r.attempt}/${r.maxRetries} in ${r.delayMs}ms (${r.reason})`)
     }
   );
   return typeof response.statusCode === "number" && response.statusCode >= 200 && response.statusCode < 300;
 }
-async function cleanup() {
+async function post() {
   const accessToken = getState("access_token");
   const logfireUrl = getState("logfire_url");
   if (getState("skip_cleanup") === "true") {
@@ -265,4 +273,6 @@ async function cleanup() {
     warning(`Token revocation failed: ${error.message} (token will expire naturally)`);
   }
 }
-void cleanup();
+
+// src/cleanup.ts
+void post();

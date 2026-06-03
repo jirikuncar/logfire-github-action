@@ -74,6 +74,21 @@ export function inNoProxy(hostname: string, port: string, noProxy: string): bool
     });
 }
 
+/** The port to connect to on a proxy, applying protocol defaults. */
+export function resolveProxyPort(proxy: URL): number {
+  if (proxy.port) return Number(proxy.port);
+  return proxy.protocol === 'https:' ? 443 : 80;
+}
+
+/**
+ * The SNI servername to present: an explicit override wins; otherwise the
+ * hostname, unless it is an IP literal (RFC 6066 forbids SNI for IPs).
+ */
+export function selectServername(optionServername: unknown, hostname: string): string | undefined {
+  if (typeof optionServername === 'string') return optionServername;
+  return net.isIP(hostname) ? undefined : hostname;
+}
+
 /**
  * Resolve the proxy URL for a target, or '' if it should be reached directly.
  * Mirrors the de-facto `proxy-from-env` semantics.
@@ -157,7 +172,7 @@ export function makeRequest(
       const creds = `${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`;
       proxyHeaders['Proxy-Authorization'] = `Basic ${Buffer.from(creds).toString('base64')}`;
     }
-    const proxyPort = proxy.port || (proxy.protocol === 'https:' ? 443 : 80);
+    const proxyPort = resolveProxyPort(proxy);
 
     // Plain HTTP through a proxy: send the absolute URL as the request path.
     if (!isHttps) {
@@ -196,28 +211,24 @@ export function makeRequest(
         fail(new Error(`Proxy CONNECT to ${target.host} failed (HTTP ${res.statusCode})`));
         return;
       }
-      // SNI must not be an IP literal (RFC 6066); prefer an explicit
-      // options.servername, else the hostname, else omit it for IPs. Forward
-      // the caller's TLS trust settings so the tunneled connection verifies the
-      // same way a direct https request would.
-      const servername =
-        typeof options.servername === 'string'
-          ? options.servername
-          : net.isIP(target.hostname)
-            ? undefined
-            : target.hostname;
-      const tlsSocket = tls.connect({
-        socket,
-        servername,
-        ca: options.ca,
-        rejectUnauthorized: options.rejectUnauthorized,
-      });
-      tlsSocket.on('error', fail);
-      const req = https.request(
-        targetUrl,
-        { ...options, agent: false, createConnection: () => tlsSocket },
-        onResponse,
-      );
+      // Run TLS over the established tunnel. A request-level `createConnection`
+      // is ignored once an Agent is involved, so route it through a one-off
+      // Agent whose createConnection returns the tunneled TLS socket (the
+      // https-proxy-agent pattern). Forward the caller's TLS trust settings so
+      // the tunneled connection verifies like a direct https request would.
+      const servername = selectServername(options.servername, target.hostname);
+      const tunnelAgent = new https.Agent();
+      tunnelAgent.createConnection = (() => {
+        const tlsSocket = tls.connect({
+          socket,
+          servername,
+          ca: options.ca,
+          rejectUnauthorized: options.rejectUnauthorized,
+        });
+        tlsSocket.on('error', fail);
+        return tlsSocket;
+      }) as typeof tunnelAgent.createConnection;
+      const req = https.request(targetUrl, { ...options, agent: tunnelAgent }, onResponse);
       wire(req);
     });
     connectReq.end();

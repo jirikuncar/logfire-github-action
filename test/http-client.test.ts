@@ -6,7 +6,13 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { getProxyForUrl, inNoProxy, requestWithRetry } from '../src/http-client';
+import {
+  getProxyForUrl,
+  inNoProxy,
+  requestWithRetry,
+  resolveProxyPort,
+  selectServername,
+} from '../src/http-client';
 
 /**
  * Generate a throwaway self-signed cert (CN=localhost) into a fresh temp dir.
@@ -91,6 +97,44 @@ describe('getProxyForUrl', () => {
     expect(
       getProxyForUrl('https://x.com:8443', { HTTPS_PROXY: 'http://p', NO_PROXY: 'x.com:443' }),
     ).toBe('http://p');
+  });
+
+  it('returns empty for an unparseable target URL', () => {
+    expect(getProxyForUrl('http://[not a url', { HTTPS_PROXY: 'http://p' })).toBe('');
+  });
+
+  it('ignores a NO_PROXY entry that normalizes to empty', () => {
+    // "." normalizes to an empty host and must not match anything.
+    expect(getProxyForUrl('https://x.com', { HTTPS_PROXY: 'http://p', NO_PROXY: '.' })).toBe(
+      'http://p',
+    );
+  });
+});
+
+describe('resolveProxyPort', () => {
+  it('uses the explicit port', () => {
+    expect(resolveProxyPort(new URL('http://p:8080'))).toBe(8080);
+  });
+  it('defaults http to 80', () => {
+    expect(resolveProxyPort(new URL('http://p'))).toBe(80);
+  });
+  it('defaults https to 443', () => {
+    expect(resolveProxyPort(new URL('https://p'))).toBe(443);
+  });
+});
+
+describe('selectServername', () => {
+  it('prefers an explicit servername', () => {
+    expect(selectServername('localhost', '127.0.0.1')).toBe('localhost');
+  });
+  it('uses the hostname when it is not an IP', () => {
+    expect(selectServername(undefined, 'example.com')).toBe('example.com');
+  });
+  it('omits SNI for an IPv4 literal', () => {
+    expect(selectServername(undefined, '127.0.0.1')).toBeUndefined();
+  });
+  it('omits SNI for an IPv6 literal', () => {
+    expect(selectServername(undefined, '::1')).toBeUndefined();
   });
 });
 
@@ -188,6 +232,63 @@ describe('requestWithRetry', () => {
     server.close();
   });
 
+  it('retries without an onRetry callback', async () => {
+    let hits = 0;
+    const server = http.createServer((_req, res) => {
+      hits += 1;
+      res.writeHead(hits < 2 ? 503 : 200);
+      res.end(hits < 2 ? 'wait' : 'ok');
+    });
+    const port = await listen(server);
+
+    // No onRetry provided — exercises the default no-op.
+    const r = await requestWithRetry(`http://127.0.0.1:${port}/`, { method: 'GET' }, undefined, {
+      baseDelayMs: 1,
+    });
+
+    expect(r.statusCode).toBe(200);
+    expect(hits).toBe(2);
+    server.close();
+  });
+
+  it('proxies through an authenticated proxy and defaults the method to GET', async () => {
+    const upstream = http.createServer((_req, res) => {
+      res.writeHead(200);
+      res.end('auth-ok');
+    });
+    const upPort = await listen(upstream);
+
+    let proxyAuth: string | undefined;
+    let seenMethod: string | undefined;
+    const proxy = http.createServer((req, res) => {
+      proxyAuth = req.headers['proxy-authorization'];
+      seenMethod = req.method;
+      const u = new URL(req.url!);
+      http.get({ host: u.hostname, port: u.port, path: u.pathname }, (pr) => {
+        let d = '';
+        pr.on('data', (c) => (d += c));
+        pr.on('end', () => {
+          res.writeHead(pr.statusCode!);
+          res.end(d);
+        });
+      });
+    });
+    const proxyPort = await listen(proxy);
+
+    // No `method` in options → defaults to GET. Proxy URL carries credentials.
+    const r = await requestWithRetry(`http://127.0.0.1:${upPort}/y`, {}, undefined, {
+      proxy: `http://user:p%40ss@127.0.0.1:${proxyPort}`,
+      maxRetries: 0,
+    });
+
+    expect(r.statusCode).toBe(200);
+    expect(r.body).toBe('auth-ok');
+    expect(seenMethod).toBe('GET');
+    expect(proxyAuth).toBe(`Basic ${Buffer.from('user:p@ss').toString('base64')}`);
+    upstream.close();
+    proxy.close();
+  });
+
   it('proxies plain HTTP using the absolute-form request path', async () => {
     const upstream = http.createServer((_req, res) => {
       res.writeHead(200);
@@ -247,11 +348,14 @@ describe('requestWithRetry over a CONNECT proxy (TLS tunnel)', () => {
     const upPort = await listen(upstream);
 
     let connectTarget: string | undefined;
+    // The proxy ignores the requested host and routes to the real upstream.
+    // The client targets `tunnel.invalid`, which does NOT resolve — so the
+    // request can only succeed if it genuinely goes through the tunnel socket
+    // (i.e. our custom Agent.createConnection is honored), not a direct dial.
     const proxy = http.createServer();
     proxy.on('connect', (req, clientSocket, head) => {
       connectTarget = req.url;
-      const [host, p] = req.url!.split(':');
-      const up = net.connect(parseInt(p!), host, () => {
+      const up = net.connect(upPort, '127.0.0.1', () => {
         clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
         if (head?.length) up.write(head);
         up.pipe(clientSocket);
@@ -262,11 +366,10 @@ describe('requestWithRetry over a CONNECT proxy (TLS tunnel)', () => {
     });
     const proxyPort = await listen(proxy);
 
-    // Connect to 127.0.0.1 (unambiguous, no DNS/IPv6 flakiness) but verify
-    // against the generated CA with servername 'localhost' — exercises real TLS
-    // verification through the tunnel without disabling it globally.
+    // Verify against the generated CA with servername 'localhost' (the cert's
+    // SAN) — exercises real TLS verification through the tunnel.
     const r = await requestWithRetry(
-      `https://127.0.0.1:${upPort}/`,
+      `https://tunnel.invalid/`,
       { method: 'GET', ca: cert.cert, servername: 'localhost' },
       undefined,
       { proxy: `http://127.0.0.1:${proxyPort}`, timeoutMs: 5000, maxRetries: 1 },
@@ -274,8 +377,44 @@ describe('requestWithRetry over a CONNECT proxy (TLS tunnel)', () => {
 
     expect(r.statusCode).toBe(200);
     expect(r.body).toBe('tunneled-ok');
-    expect(connectTarget).toBe(`127.0.0.1:${upPort}`);
+    expect(connectTarget).toBe('tunnel.invalid:443');
     upstream.close();
+    proxy.close();
+  });
+
+  it('rejects when the proxy refuses the CONNECT', async () => {
+    const proxy = http.createServer();
+    proxy.on('connect', (_req, clientSocket) => {
+      clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+      clientSocket.end();
+    });
+    const proxyPort = await listen(proxy);
+
+    // Portless https target → CONNECT path uses the default 443.
+    await expect(
+      requestWithRetry(`https://example.invalid/`, { method: 'GET' }, undefined, {
+        proxy: `http://127.0.0.1:${proxyPort}`,
+        timeoutMs: 2000,
+        maxRetries: 0,
+      }),
+    ).rejects.toThrow(/Proxy CONNECT to example\.invalid failed \(HTTP 502\)/);
+    proxy.close();
+  });
+
+  it('rejects when the proxy never completes the CONNECT (timeout)', async () => {
+    // Raw TCP server that accepts the socket but never answers the CONNECT.
+    const proxy = net.createServer(() => {
+      /* hold the connection open, send nothing */
+    });
+    const proxyPort = await listen(proxy as unknown as http.Server);
+
+    await expect(
+      requestWithRetry(`https://example.invalid/`, { method: 'GET' }, undefined, {
+        proxy: `http://127.0.0.1:${proxyPort}`,
+        timeoutMs: 150,
+        maxRetries: 0,
+      }),
+    ).rejects.toThrow(/Proxy CONNECT to example\.invalid timed out/);
     proxy.close();
   });
 });

@@ -7,7 +7,15 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       include: ['src/**/*.ts'],
+      // Entry shims just call run()/post(); their logic lives in run.ts/post.ts.
+      exclude: ['src/main.ts', 'src/cleanup.ts'],
       reporter: ['text', 'lcov'],
+      thresholds: {
+        statements: 100,
+        branches: 100,
+        functions: 100,
+        lines: 100,
+      },
     },
   },
 });
