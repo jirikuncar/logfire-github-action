@@ -41,19 +41,19 @@ Pass the action's outputs into the steps that need them — the action itself do
 
 ## Inputs
 
-| Input | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `organization` | Yes¹ | — | Logfire organization slug. Mutually exclusive with `audience` |
-| `project` | No | — | Logfire project slug. Narrows the issued token to a single project (when the policy is org-wide), or pins to the policy's project (when bound). Mutually exclusive with `audience` |
-| `scopes` | No | Trust policy default | Space-separated subset of the trust policy's scopes (e.g. `project:write_otlp project:read_otlp`) |
-| `region` | No | `us` | Region preset: `us`, `eu`, `staging-eu` |
-| `url` | No | — | Custom Logfire API URL (overrides `region`) |
-| `audience` | No | resolved Logfire URL² | Full audience, used verbatim. Mutually exclusive with `organization`/`project` |
-| `job-id` | No | `github.job` | Unique job ID for traceparent (use with matrix) |
-| `skip-cleanup` | No | `false` | When `true`, skip post-job token revocation and let the token expire naturally |
-| `max-retries` | No | `3` | Retry attempts for transient HTTP failures (network/timeout/408/429/5xx). `0` disables |
-| `request-timeout` | No | `10` | Per-request socket timeout, in seconds |
-| `proxy` | No | env | Proxy URL; falls back to `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` env vars |
+| Input             | Required | Default               | Description                                                                                                                                                                        |
+| ----------------- | -------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `organization`    | Yes¹     | —                     | Logfire organization slug. Mutually exclusive with `audience`                                                                                                                      |
+| `project`         | No       | —                     | Logfire project slug. Narrows the issued token to a single project (when the policy is org-wide), or pins to the policy's project (when bound). Mutually exclusive with `audience` |
+| `scopes`          | No       | Trust policy default  | Space-separated subset of the trust policy's scopes (e.g. `project:write_otlp project:read_otlp`)                                                                                  |
+| `region`          | No       | `us`                  | Region preset: `us`, `eu`, `staging-eu`                                                                                                                                            |
+| `url`             | No       | —                     | Custom Logfire API URL (overrides `region`)                                                                                                                                        |
+| `audience`        | No       | resolved Logfire URL² | Full audience, used verbatim. Mutually exclusive with `organization`/`project`                                                                                                     |
+| `job-id`          | No       | `github.job`          | Unique job ID for traceparent (use with matrix)                                                                                                                                    |
+| `skip-cleanup`    | No       | `false`               | When `true`, skip post-job token revocation and let the token expire naturally                                                                                                     |
+| `max-retries`     | No       | `3`                   | Retry attempts for transient HTTP failures (network/timeout/408/429/5xx). `0` disables                                                                                             |
+| `request-timeout` | No       | `10`                  | Per-request socket timeout, in seconds                                                                                                                                             |
+| `proxy`           | No       | env                   | Proxy URL; falls back to `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` env vars                                                                                                            |
 
 ¹ Required unless you provide a full `audience` that already encodes the org/project path.
 ² When `audience` is omitted, the GitHub OIDC JWT `aud` claim defaults to the resolved Logfire URL and the exchange audience is built as `{resolvedUrl}/{organization}[/{project}]`. When `audience` is provided it is used verbatim for both — `organization`/`project` must then be omitted.
@@ -62,14 +62,14 @@ Token TTL is fixed by the trust policy (`token_ttl_seconds`). The action cannot 
 
 ## Outputs
 
-| Output | Description |
-|--------|-------------|
-| `token` | Short-lived Logfire workload JWT |
-| `traceparent` | W3C traceparent header value |
-| `trace-id` | Deterministic trace ID for this workflow run |
-| `expires-in` | Token TTL in seconds (set by the trust policy) |
-| `scopes` | Granted scopes (may be narrower than requested) |
-| `logfire-url` | Resolved Logfire API URL |
+| Output        | Description                                     |
+| ------------- | ----------------------------------------------- |
+| `token`       | Short-lived Logfire workload JWT                |
+| `traceparent` | W3C traceparent header value                    |
+| `trace-id`    | Deterministic trace ID for this workflow run    |
+| `expires-in`  | Token TTL in seconds (set by the trust policy)  |
+| `scopes`      | Granted scopes (may be narrower than requested) |
+| `logfire-url` | Resolved Logfire API URL                        |
 
 ## Configuration Examples
 
@@ -156,7 +156,7 @@ Under the hood the action sends the audience as `{audience}/{organization}/{proj
 
 Important boundaries:
 
-- **Downscope only.** If the trust policy is *already* bound to a project, passing a different project here is rejected (`invalid_target`). You can pass the same project as a no-op or omit it.
+- **Downscope only.** If the trust policy is _already_ bound to a project, passing a different project here is rejected (`invalid_target`). You can pass the same project as a no-op or omit it.
 - **Org-wide token.** Omitting the `project` input against an org-wide policy keeps the issued token org-wide — useful for org-spanning workflows, but consider whether a project-scoped token would be a tighter fit. Resource servers that require a project binding (e.g. the OTLP intake) will reject org-wide tokens.
 - **The project must exist in the same org.** A typo in the slug surfaces as `invalid_target` at exchange time rather than as a confusing scope error later.
 
@@ -297,15 +297,15 @@ Copy the exact `repository`, `ref`, `environment`, … values from that output i
 
 In **Settings → OIDC Trust Policies → New policy**:
 
-| Field | What to set |
-|-------|-------------|
-| **Name** | Anything memorable (1–128 chars), e.g. `ci-main-otlp` |
-| **Provider** | `GitHub` — this auto-pins `iss = https://token.actions.githubusercontent.com` for you |
-| **Project** | Leave **empty** for an org-wide policy (narrow per-workflow with the action's `project` input), or bind it to one project |
-| **Claims** | The JSON object from step 1 — the claims that must match (see examples below) |
-| **Allowed algorithms** | Leave `RS256` (GitHub signs with RS256) |
-| **Scopes** | The subset of the [scope allowlist](#available-scopes) this CI may request |
-| **Token TTL** | Seconds the issued token lives, `60`–`3600` (default `600`) |
+| Field                  | What to set                                                                                                               |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| **Name**               | Anything memorable (1–128 chars), e.g. `ci-main-otlp`                                                                     |
+| **Provider**           | `GitHub` — this auto-pins `iss = https://token.actions.githubusercontent.com` for you                                     |
+| **Project**            | Leave **empty** for an org-wide policy (narrow per-workflow with the action's `project` input), or bind it to one project |
+| **Claims**             | The JSON object from step 1 — the claims that must match (see examples below)                                             |
+| **Allowed algorithms** | Leave `RS256` (GitHub signs with RS256)                                                                                   |
+| **Scopes**             | The subset of the [scope allowlist](#available-scopes) this CI may request                                                |
+| **Token TTL**          | Seconds the issued token lives, `60`–`3600` (default `600`)                                                               |
 
 Then **activate** it. (An active policy must have a non-empty claim set, and each distinct claim set must be unique within the org.)
 
@@ -322,14 +322,14 @@ Then **activate** it. (An active policy must have a non-empty claim set, and eac
 // Only main-branch builds of one repo
 {
   "repository_id": "123456789",
-  "ref": "refs/heads/main"
+  "ref": "refs/heads/main",
 }
 ```
 
 ```jsonc
 // Any workflow in the whole org (broad — pair with tight scopes)
 {
-  "repository_owner_id": "987654"
+  "repository_owner_id": "987654",
 }
 ```
 
@@ -337,7 +337,7 @@ Then **activate** it. (An active policy must have a non-empty claim set, and eac
 // Gated on a GitHub Environment (e.g. requires approval)
 {
   "repository_id": "123456789",
-  "environment": "production"
+  "environment": "production",
 }
 ```
 
@@ -350,3 +350,7 @@ A requested scope must be a subset of the policy's scopes. The workload-token al
 `organization:read` · `organization:read_channel` · `organization:auditlog` · `project:read` · `project:write` · `project:read_token` · `project:write_token` · `project:read_dashboard` · `project:write_dashboard` · `project:read_alert` · `project:write_alert` · `project:read_datasets` · `project:write_datasets` · `project:read_variables` · `project:gateway_proxy` · `project:read_otlp` · `project:write_otlp`
 
 For most CI telemetry you want `project:write_otlp` (send spans/metrics) and/or `project:read_otlp` (query). See [Narrowing scopes per workflow](#narrowing-scopes-per-workflow).
+
+## Contributing
+
+The Action is written in TypeScript and bundled to `dist/`. See [DEVELOPMENT.md](DEVELOPMENT.md) for the build, test, and release workflow.

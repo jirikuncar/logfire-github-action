@@ -1,4 +1,3 @@
-// @ts-check
 /**
  * Shared HTTP client for the Logfire OIDC action.
  *
@@ -13,26 +12,49 @@
  *     errors, request timeouts, HTTP 408/429, and 5xx). 4xx responses are
  *     returned as-is so the caller can surface a permanent policy rejection.
  *
- * Built-in Node.js modules only — no npm dependencies.
+ * Built-in Node.js modules only — no runtime npm dependencies.
  */
 
-const http = require('http');
-const https = require('https');
-const tls = require('tls');
+import * as http from 'node:http';
+import * as https from 'node:https';
+import * as net from 'node:net';
+import * as tls from 'node:tls';
 
 const DEFAULT_TIMEOUT_MS = 10000;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_BASE_DELAY_MS = 200;
 const MAX_DELAY_MS = 10000;
 
+export interface HttpResponse {
+  statusCode: number | undefined;
+  body: string;
+  headers: http.IncomingHttpHeaders;
+}
+
+export interface RetryInfo {
+  attempt: number;
+  maxRetries: number;
+  reason: string;
+  delayMs: number;
+}
+
+export interface RequestOpts {
+  /** Max retry attempts on transient failures. Default 3; 0 disables. */
+  maxRetries?: number;
+  /** Per-request socket timeout in milliseconds. Default 10000. */
+  timeoutMs?: number;
+  /** Base backoff delay in milliseconds. Default 200. */
+  baseDelayMs?: number;
+  /** Explicit proxy override; '' / undefined falls back to the proxy env vars. */
+  proxy?: string;
+  /** Invoked before each retry sleep. */
+  onRetry?: (info: RetryInfo) => void;
+}
+
 // --- Proxy resolution (HTTPS_PROXY / HTTP_PROXY / ALL_PROXY / NO_PROXY) ---
 
-/**
- * @param {string} hostname
- * @param {string} port
- * @param {string} noProxy comma/space-separated NO_PROXY list
- */
-function inNoProxy(hostname, port, noProxy) {
+/** @param noProxy comma/space-separated NO_PROXY list */
+export function inNoProxy(hostname: string, port: string, noProxy: string): boolean {
   return noProxy
     .split(/[\s,]+/)
     .filter(Boolean)
@@ -41,8 +63,8 @@ function inNoProxy(hostname, port, noProxy) {
       let entryPort = '';
       const m = entry.match(/^(.+):(\d+)$/);
       if (m) {
-        host = m[1];
-        entryPort = m[2];
+        host = m[1]!;
+        entryPort = m[2]!;
       }
       if (entryPort && entryPort !== String(port)) return false;
       // Normalize leading "*." or "." so ".example.com" matches "example.com".
@@ -53,18 +75,14 @@ function inNoProxy(hostname, port, noProxy) {
 }
 
 /**
- * Resolve the proxy URL for a target, or '' if the target should be reached
- * directly. Mirrors the de-facto `proxy-from-env` semantics.
- * @param {string} targetUrl
- * @param {NodeJS.ProcessEnv} [env]
- * @returns {string}
+ * Resolve the proxy URL for a target, or '' if it should be reached directly.
+ * Mirrors the de-facto `proxy-from-env` semantics.
  */
-function getProxyForUrl(targetUrl, env) {
-  env = env || process.env;
-  let target;
+export function getProxyForUrl(targetUrl: string, env: NodeJS.ProcessEnv = process.env): string {
+  let target: URL;
   try {
     target = new URL(targetUrl);
-  } catch (_) {
+  } catch {
     return '';
   }
   const isHttps = target.protocol === 'https:';
@@ -80,31 +98,44 @@ function getProxyForUrl(targetUrl, env) {
 
 // --- Single request (timeout + optional proxy) ---
 
-/**
- * @param {string} targetUrl
- * @param {https.RequestOptions} options
- * @param {string|undefined} body
- * @param {string} proxyUrl '' for a direct connection
- * @param {number} timeoutMs
- * @returns {Promise<{statusCode: number|undefined, body: string, headers: http.IncomingHttpHeaders}>}
- */
-function makeRequest(targetUrl, options, body, proxyUrl, timeoutMs) {
-  return new Promise((resolve, reject) => {
+/** @param proxyUrl '' for a direct connection */
+export function makeRequest(
+  targetUrl: string,
+  options: https.RequestOptions,
+  body: string | undefined,
+  proxyUrl: string,
+  timeoutMs: number,
+): Promise<HttpResponse> {
+  return new Promise<HttpResponse>((resolve, reject) => {
     const target = new URL(targetUrl);
     const isHttps = target.protocol === 'https:';
     let done = false;
-    const succeed = (r) => { if (!done) { done = true; resolve(r); } };
-    const fail = (e) => { if (!done) { done = true; reject(e); } };
+    const succeed = (r: HttpResponse) => {
+      if (!done) {
+        done = true;
+        resolve(r);
+      }
+    };
+    const fail = (e: Error) => {
+      if (!done) {
+        done = true;
+        reject(e);
+      }
+    };
 
-    const onResponse = (res) => {
+    const onResponse = (res: http.IncomingMessage) => {
       let data = '';
       res.setEncoding('utf8');
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => succeed({ statusCode: res.statusCode, body: data, headers: res.headers }));
+      res.on('data', (chunk: string) => {
+        data += chunk;
+      });
+      res.on('end', () =>
+        succeed({ statusCode: res.statusCode, body: data, headers: res.headers }),
+      );
       res.on('error', fail);
     };
 
-    const wire = (req) => {
+    const wire = (req: http.ClientRequest) => {
       req.on('error', fail);
       req.setTimeout(timeoutMs, () => {
         req.destroy(new Error(`Request to ${target.host} timed out after ${timeoutMs}ms`));
@@ -121,7 +152,7 @@ function makeRequest(targetUrl, options, body, proxyUrl, timeoutMs) {
     }
 
     const proxy = new URL(proxyUrl);
-    const proxyHeaders = {};
+    const proxyHeaders: Record<string, string> = {};
     if (proxy.username) {
       const creds = `${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`;
       proxyHeaders['Proxy-Authorization'] = `Basic ${Buffer.from(creds).toString('base64')}`;
@@ -130,13 +161,16 @@ function makeRequest(targetUrl, options, body, proxyUrl, timeoutMs) {
 
     // Plain HTTP through a proxy: send the absolute URL as the request path.
     if (!isHttps) {
-      const req = http.request({
-        host: proxy.hostname,
-        port: proxyPort,
-        method: options.method || 'GET',
-        path: targetUrl,
-        headers: { ...(options.headers || {}), ...proxyHeaders, Host: target.host },
-      }, onResponse);
+      const req = http.request(
+        {
+          host: proxy.hostname,
+          port: proxyPort,
+          method: options.method || 'GET',
+          path: targetUrl,
+          headers: { ...(options.headers || {}), ...proxyHeaders, Host: target.host },
+        },
+        onResponse,
+      );
       wire(req);
       return;
     }
@@ -152,9 +186,11 @@ function makeRequest(targetUrl, options, body, proxyUrl, timeoutMs) {
     });
     connectReq.on('error', fail);
     connectReq.setTimeout(timeoutMs, () => {
-      connectReq.destroy(new Error(`Proxy CONNECT to ${target.host} timed out after ${timeoutMs}ms`));
+      connectReq.destroy(
+        new Error(`Proxy CONNECT to ${target.host} timed out after ${timeoutMs}ms`),
+      );
     });
-    connectReq.on('connect', (res, socket) => {
+    connectReq.on('connect', (res: http.IncomingMessage, socket: net.Socket) => {
       if (res.statusCode !== 200) {
         socket.destroy();
         fail(new Error(`Proxy CONNECT to ${target.host} failed (HTTP ${res.statusCode})`));
@@ -162,11 +198,11 @@ function makeRequest(targetUrl, options, body, proxyUrl, timeoutMs) {
       }
       const tlsSocket = tls.connect({ socket, servername: target.hostname });
       tlsSocket.on('error', fail);
-      const req = https.request(targetUrl, {
-        ...options,
-        agent: false,
-        createConnection: () => tlsSocket,
-      }, onResponse);
+      const req = https.request(
+        targetUrl,
+        { ...options, agent: false, createConnection: () => tlsSocket },
+        onResponse,
+      );
       wire(req);
     });
     connectReq.end();
@@ -175,39 +211,34 @@ function makeRequest(targetUrl, options, body, proxyUrl, timeoutMs) {
 
 // --- Retry with jittered exponential backoff ---
 
-function sleep(ms) {
+function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Full-jitter backoff, capped. @param {number} base @param {number} attempt */
-function backoffDelay(base, attempt) {
+/** Full-jitter backoff, capped. */
+function backoffDelay(base: number, attempt: number): number {
   const ceiling = Math.min(base * 2 ** attempt, MAX_DELAY_MS);
   return Math.floor(Math.random() * ceiling);
 }
 
-/** @param {number|undefined} status */
-function isRetryableStatus(status) {
-  return status === 408 || status === 429 || (typeof status === 'number' && status >= 500 && status <= 599);
+function isRetryableStatus(status: number | undefined): boolean {
+  return (
+    status === 408 ||
+    status === 429 ||
+    (typeof status === 'number' && status >= 500 && status <= 599)
+  );
 }
 
-/**
- * @typedef {Object} RequestOpts
- * @property {number} [maxRetries]
- * @property {number} [timeoutMs]
- * @property {number} [baseDelayMs]
- * @property {string} [proxy] explicit proxy override; '' / undefined falls back to env
- * @property {(info: {attempt: number, maxRetries: number, reason: string, delayMs: number}) => void} [onRetry]
- */
-
-/**
- * Make an HTTP(S) request, retrying transient failures.
- * @param {string} url
- * @param {https.RequestOptions} options
- * @param {string} [body]
- * @param {RequestOpts} [opts]
- */
-async function requestWithRetry(url, options, body, opts = {}) {
-  const maxRetries = Number.isFinite(opts.maxRetries) ? Math.max(0, /** @type {number} */ (opts.maxRetries)) : DEFAULT_MAX_RETRIES;
+/** Make an HTTP(S) request, retrying transient failures. */
+export async function requestWithRetry(
+  url: string,
+  options: https.RequestOptions,
+  body?: string,
+  opts: RequestOpts = {},
+): Promise<HttpResponse> {
+  const maxRetries = Number.isFinite(opts.maxRetries)
+    ? Math.max(0, opts.maxRetries!)
+    : DEFAULT_MAX_RETRIES;
   const timeoutMs = opts.timeoutMs || DEFAULT_TIMEOUT_MS;
   const baseDelayMs = opts.baseDelayMs || DEFAULT_BASE_DELAY_MS;
   const onRetry = opts.onRetry || (() => {});
@@ -219,7 +250,12 @@ async function requestWithRetry(url, options, body, opts = {}) {
       const response = await makeRequest(url, options, body, proxyUrl, timeoutMs);
       if (attempt < maxRetries && isRetryableStatus(response.statusCode)) {
         const delayMs = backoffDelay(baseDelayMs, attempt);
-        onRetry({ attempt: attempt + 1, maxRetries, reason: `HTTP ${response.statusCode}`, delayMs });
+        onRetry({
+          attempt: attempt + 1,
+          maxRetries,
+          reason: `HTTP ${response.statusCode}`,
+          delayMs,
+        });
         await sleep(delayMs);
         attempt += 1;
         continue;
@@ -228,16 +264,9 @@ async function requestWithRetry(url, options, body, opts = {}) {
     } catch (err) {
       if (attempt >= maxRetries) throw err;
       const delayMs = backoffDelay(baseDelayMs, attempt);
-      onRetry({ attempt: attempt + 1, maxRetries, reason: err.message, delayMs });
+      onRetry({ attempt: attempt + 1, maxRetries, reason: (err as Error).message, delayMs });
       await sleep(delayMs);
       attempt += 1;
     }
   }
 }
-
-module.exports = {
-  requestWithRetry,
-  makeRequest,
-  getProxyForUrl,
-  inNoProxy,
-};

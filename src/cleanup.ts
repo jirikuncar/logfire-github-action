@@ -1,51 +1,57 @@
-// @ts-check
 /**
  * Logfire OIDC Auth — post-action cleanup.
  *
  * Revokes the workload token issued during the main step via the RFC 7009
  * revocation endpoint (`POST /api/oauth/revoke`). Runs as the `post` entry
  * point, so it executes even when the job fails.
- *
- * Uses only built-in Node.js modules — no npm dependencies required.
  */
 
-const { requestWithRetry } = require('./http-client');
+import { requestWithRetry } from './http-client';
 
-function getState(name) {
+function getState(name: string): string {
   return (process.env[`STATE_${name}`] || '').trim();
 }
 
-function warning(message) {
+function warning(message: string): void {
   console.log(`::warning::${message}`);
 }
 
-function debug(message) {
+function debug(message: string): void {
   console.log(`::debug::${message}`);
 }
 
-async function revokeToken(revokeUrl, token) {
+async function revokeToken(revokeUrl: string, token: string): Promise<boolean> {
   const formBody = new URLSearchParams({
     token,
     token_type_hint: 'access_token',
   }).toString();
 
-  const response = await requestWithRetry(revokeUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Content-Length': Buffer.byteLength(formBody),
+  const response = await requestWithRetry(
+    revokeUrl,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(formBody),
+      },
     },
-  }, formBody, {
-    /** @param {{attempt: number, maxRetries: number, reason: string, delayMs: number}} info */
-    onRetry: (info) => debug(`Revoke retry ${info.attempt}/${info.maxRetries} in ${info.delayMs}ms (${info.reason})`),
-  });
+    formBody,
+    {
+      onRetry: (info) =>
+        debug(
+          `Revoke retry ${info.attempt}/${info.maxRetries} in ${info.delayMs}ms (${info.reason})`,
+        ),
+    },
+  );
 
-  return typeof response.statusCode === 'number'
-    && response.statusCode >= 200
-    && response.statusCode < 300;
+  return (
+    typeof response.statusCode === 'number' &&
+    response.statusCode >= 200 &&
+    response.statusCode < 300
+  );
 }
 
-async function cleanup() {
+async function cleanup(): Promise<void> {
   const accessToken = getState('access_token');
   const logfireUrl = getState('logfire_url');
 
@@ -70,8 +76,8 @@ async function cleanup() {
       warning('Token revocation returned non-200 (token will expire naturally)');
     }
   } catch (error) {
-    warning(`Token revocation failed: ${error.message} (token will expire naturally)`);
+    warning(`Token revocation failed: ${(error as Error).message} (token will expire naturally)`);
   }
 }
 
-cleanup();
+void cleanup();

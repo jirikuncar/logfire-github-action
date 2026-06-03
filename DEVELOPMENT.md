@@ -1,0 +1,71 @@
+# Development
+
+This Action is written in **TypeScript** (`src/`) and bundled to self-contained JavaScript (`dist/`) that the GitHub Actions runner executes. There are no runtime npm dependencies — everything the Action needs is bundled into `dist/`.
+
+## Prerequisites
+
+- **Node.js 24** (see [`.node-version`](.node-version))
+- **pnpm** (pinned via the `packageManager` field; `corepack enable` will provision the right version)
+
+```bash
+corepack enable
+pnpm install
+```
+
+## Layout
+
+| Path                 | Purpose                                                                      |
+| -------------------- | ---------------------------------------------------------------------------- |
+| `src/main.ts`        | Main entry point — OIDC fetch + RFC 8693 token exchange                      |
+| `src/cleanup.ts`     | `post` entry point — RFC 7009 token revocation                               |
+| `src/http-client.ts` | Built-in HTTP client (timeout, retry/backoff, proxy/CONNECT)                 |
+| `test/`              | Vitest suite + TLS fixtures (`test/fixtures/`)                               |
+| `dist/`              | **Committed** bundle the runner executes (`dist/main.js`, `dist/cleanup.js`) |
+| `action.yml`         | Action metadata; `runs.main`/`runs.post` point at `dist/`                    |
+
+## Scripts
+
+| Command                            | What it does                                   |
+| ---------------------------------- | ---------------------------------------------- |
+| `pnpm run build`                   | Typecheck, then bundle `src/` → `dist/`        |
+| `pnpm run bundle`                  | Bundle only (esbuild, `--target=node24`)       |
+| `pnpm run watch`                   | Rebuild `dist/` on change (esbuild watch mode) |
+| `pnpm run typecheck`               | `tsc --noEmit`                                 |
+| `pnpm run test`                    | Run the Vitest suite once                      |
+| `pnpm run test:watch`              | Vitest in watch mode                           |
+| `pnpm run coverage`                | Tests with V8 coverage                         |
+| `pnpm run lint` / `lint:fix`       | ESLint (typescript-eslint)                     |
+| `pnpm run format` / `format:check` | Prettier write / check                         |
+| `pnpm run all`                     | lint → typecheck → test → bundle (mirrors CI)  |
+
+## The `dist/` bundle
+
+`dist/` is **committed to the repository** because GitHub runs the Action straight from the ref — there is no install step on the runner. Any change under `src/` must be rebuilt and the updated `dist/` committed in the same change:
+
+```bash
+pnpm run build
+git add dist
+```
+
+CI enforces this:
+
+- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs lint, format check, typecheck, tests, and a build on every push/PR.
+- [`.github/workflows/check-dist.yml`](.github/workflows/check-dist.yml) rebuilds `dist/` and fails if the committed output differs from a fresh build (it uploads the rebuilt `dist/` as an artifact on failure so you can inspect the diff).
+
+If `check-dist` is red, run `pnpm run build` locally and commit the result.
+
+## Testing notes
+
+The HTTP client is covered by `test/http-client.test.ts`, which spins up local servers (no outbound network) to exercise:
+
+- proxy resolution and `NO_PROXY` matching (`getProxyForUrl` / `inNoProxy`);
+- retry on `5xx`, no-retry on `4xx`, timeout-throws, and timeout-then-retry behavior;
+- plain-HTTP proxying (absolute-form request path);
+- HTTPS through an `http` `CONNECT` proxy (TLS-over-tunnel). The suite generates a throwaway self-signed cert (`CN=localhost`) into a temp dir at setup via `openssl` — no key material is committed — and removes it afterward. It sets `NODE_TLS_REJECT_UNAUTHORIZED=0` for that suite only (restored after) so the generated cert is accepted.
+
+> The CONNECT-tunnel suite shells out to `openssl` (present on the dev machines and `ubuntu-latest`). If `openssl` isn't on `PATH`, that suite will fail; the rest of the suite has no such requirement.
+
+## Releasing
+
+1. `pnpm run all` is green and `dist/` is committed.
+2. Tag the release and move the major-version branch/tag (e.g. `v1`) so consumers pinning `@v1` pick it up.
