@@ -1,0 +1,46 @@
+name: Check dist
+
+# dist/ is committed and is what the Action runs. This guards against it
+# drifting from src/ — rebuild and fail if the tracked output changed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check-dist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Rebuild dist
+        run: pnpm run bundle
+
+      - name: Compare committed dist
+        run: |
+          if [ -n "$(git status --porcelain dist)" ]; then
+            echo "::error::dist/ is out of date — run 'pnpm run build' and commit the result."
+            git diff --stat dist
+            exit 1
+          fi
+          echo "dist/ is up to date."
+
+      - name: Upload rebuilt dist on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

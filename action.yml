@@ -58,6 +58,6 @@ outputs:
 
 runs:
   using: 'node24'
-  main: 'main.js'
-  post: 'cleanup.js'
+  main: 'dist/main.js'
+  post: 'dist/cleanup.js'
   post-if: 'always()'
