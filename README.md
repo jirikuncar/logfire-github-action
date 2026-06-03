@@ -246,5 +246,107 @@ Both the GitHub OIDC request and the Logfire token exchange (and the post-job re
 
 ## Prerequisites
 
-1. An **OIDC trust policy** configured in your Logfire organization (Settings → OIDC Trust Policies). The policy decides which repos/refs/environments may exchange a token and what scopes the issued token carries.
+1. An **OIDC trust policy** configured in your Logfire organization (Settings → OIDC Trust Policies). The policy decides which repos/refs/environments may exchange a token and what scopes the issued token carries — see [Configuring a Trust Policy](#configuring-a-trust-policy) below.
 2. **`id-token: write`** permission in the workflow.
+
+## Configuring a Trust Policy
+
+A trust policy is a set of **GitHub OIDC JWT claims that must match** for an exchange to succeed, plus the **scopes** and **TTL** of the token that gets issued. You configure it once in Logfire (Settings → OIDC Trust Policies, organization-level).
+
+### 1. Extract the claim values with `gh`
+
+The trust policy should pin at least one **immutable** anchor — `repository_owner_id` and/or `repository_id` — because numeric IDs survive repo/owner renames while `repository`/`repository_owner` strings do not. Pull them with the GitHub CLI:
+
+```bash
+# Ready-to-paste claims object for one repository (IDs as strings, the format the policy stores)
+gh api repos/OWNER/REPO --jq '{
+  iss: "https://token.actions.githubusercontent.com",
+  repository: .full_name,
+  repository_id: (.id | tostring),
+  repository_owner: .owner.login,
+  repository_owner_id: (.owner.id | tostring)
+}'
+```
+
+```bash
+# Just the owner (org/user) — for an org-wide policy that admits every repo under it
+gh api users/OWNER --jq '{repository_owner: .login, repository_owner_id: (.id | tostring)}'
+```
+
+`ref`, `environment`, `event_name`, `actor`, `workflow`, etc. aren't derivable from the REST API — they depend on how the workflow runs. The **ground truth** for every claim is the token itself. Add a throwaway debug job and read the decoded payload from the run logs:
+
+```yaml
+jobs:
+  debug-oidc-claims:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Print this workflow's GitHub OIDC claims
+        run: |
+          TOKEN=$(curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=logfire" | jq -r '.value')
+          # Decode the JWT payload (base64url, no padding) — print every claim
+          python3 -c 'import sys,json,base64; p=sys.argv[1].split(".")[1]; print(json.dumps(json.loads(base64.urlsafe_b64decode(p+"="*(-len(p)%4))), indent=2, sort_keys=True))' "$TOKEN"
+```
+
+Copy the exact `repository`, `ref`, `environment`, … values from that output into your policy. (Use a disposable `audience` like `logfire` here — you're only inspecting claims, not exchanging.)
+
+### 2. Create the policy in Logfire
+
+In **Settings → OIDC Trust Policies → New policy**:
+
+| Field | What to set |
+|-------|-------------|
+| **Name** | Anything memorable (1–128 chars), e.g. `ci-main-otlp` |
+| **Provider** | `GitHub` — this auto-pins `iss = https://token.actions.githubusercontent.com` for you |
+| **Project** | Leave **empty** for an org-wide policy (narrow per-workflow with the action's `project` input), or bind it to one project |
+| **Claims** | The JSON object from step 1 — the claims that must match (see examples below) |
+| **Allowed algorithms** | Leave `RS256` (GitHub signs with RS256) |
+| **Scopes** | The subset of the [scope allowlist](#available-scopes) this CI may request |
+| **Token TTL** | Seconds the issued token lives, `60`–`3600` (default `600`) |
+
+Then **activate** it. (An active policy must have a non-empty claim set, and each distinct claim set must be unique within the org.)
+
+**Claim-matching rules to know:**
+
+- Keys are case-insensitive; values for `repository`, `repository_owner`, `ref`, `environment`, and `event_name` are compared **lowercased**.
+- A policy must include an immutable anchor (`repository_owner_id` or `repository_id`).
+- Tokens from `pull_request_target` events are **always rejected** (a fork-PR hardening measure).
+- Only the claims you list are checked; anything you omit is unconstrained. Pin enough to scope it tightly.
+
+#### Example claim sets
+
+```jsonc
+// Only main-branch builds of one repo
+{
+  "repository_id": "123456789",
+  "ref": "refs/heads/main"
+}
+```
+
+```jsonc
+// Any workflow in the whole org (broad — pair with tight scopes)
+{
+  "repository_owner_id": "987654"
+}
+```
+
+```jsonc
+// Gated on a GitHub Environment (e.g. requires approval)
+{
+  "repository_id": "123456789",
+  "environment": "production"
+}
+```
+
+(`iss` is added automatically when you pick the `GitHub` provider, so you don't list it yourself.)
+
+### Available scopes
+
+A requested scope must be a subset of the policy's scopes. The workload-token allowlist:
+
+`organization:read` · `organization:read_channel` · `organization:auditlog` · `project:read` · `project:write` · `project:read_token` · `project:write_token` · `project:read_dashboard` · `project:write_dashboard` · `project:read_alert` · `project:write_alert` · `project:read_datasets` · `project:write_datasets` · `project:read_variables` · `project:gateway_proxy` · `project:read_otlp` · `project:write_otlp`
+
+For most CI telemetry you want `project:write_otlp` (send spans/metrics) and/or `project:read_otlp` (query). See [Narrowing scopes per workflow](#narrowing-scopes-per-workflow).
